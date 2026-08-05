@@ -447,11 +447,13 @@ const Workspace = {
 
     _updateSelectedCount() {
         const btn = document.getElementById('ws-run-selected-btn');
+        const delBtn = document.getElementById('ws-bulk-delete-btn');
         const countEls = document.querySelectorAll('.ws-selected-count');
         const summary = document.getElementById('ws-selected-summary');
         const n = this._selectedTcIds.size;
         const total = this.testCases.length;
         if (btn) btn.disabled = n === 0;
+        if (delBtn) delBtn.disabled = n === 0;
         if (countEls) countEls.forEach(el => el.textContent = n);
         if (summary) {
             const option = summary.querySelector('option');
@@ -469,6 +471,26 @@ const Workspace = {
         this._selectedTcIds.clear();
         this._renderTestCases();
         this._updateSelectedCount();
+    },
+
+    async deleteSelectedTc() {
+        const ids = [...this._selectedTcIds];
+        if (ids.length === 0) { toast('No test cases selected', 'warning'); return; }
+        if (!confirm(`Delete ${ids.length} selected test case(s)? This cannot be undone.`)) return;
+        let ok = 0;
+        for (const id of ids) {
+            try {
+                const res = await Api.deleteTestCase(id);
+                if (res.success || res.data) ok++;
+            } catch (e) { console.warn('Delete skip:', id, e); }
+        }
+        if (ok > 0) toast(`Deleted ${ok} test case(s)`, ok === ids.length ? 'success' : 'warning');
+        this._selectedTcIds.clear();
+        this._updateSelectedCount();
+        const tcRes = await Api.getTestCases(this.projectId);
+        this.testCases = tcRes.data || [];
+        this._populateTcSelect();
+        this._renderTestCases();
     },
 
     async runSelected() {
@@ -518,6 +540,7 @@ const Workspace = {
         // Toolbar
         const toolbar = `<div class="tc-toolbar">
             <span class="tc-toolbar-info"><strong class="ws-selected-count">${this._selectedTcIds.size}</strong> selected of ${this.testCases.length}</span>
+            <button class="btn btn-sm btn-danger-outline" id="ws-bulk-delete-btn" onclick="Workspace.deleteSelectedTc()" ${this._selectedTcIds.size ? '' : 'disabled'} title="Delete selected test cases">🗑 Delete Selected</button>
             <button class="btn btn-sm btn-ghost" onclick="Workspace.selectAllTc()">Select all</button>
             <button class="btn btn-sm btn-ghost" onclick="Workspace.clearSelectedTc()">Clear</button>
         </div>`;
