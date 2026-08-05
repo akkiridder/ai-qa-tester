@@ -107,6 +107,7 @@ def plan_file_path(fn):
     return fp
 
 CONFIG_KEYS = ("ai_provider", "ollama_base_url", "ollama_model", "anthropic_api_key", "cloud_base_url", "cloud_api_key", "cloud_model")
+SECRET_KEYS = ("cloud_api_key", "anthropic_api_key")
 DEFAULT_CONFIG = {"ai_provider":"ollama","ollama_base_url":"http://localhost:11434","ollama_model":"qwen2.5-coder:3b"}
 
 def _read_config_file():
@@ -153,7 +154,7 @@ def init_config():
     file_cfg = _read_config_file()
     cfg = safe_all(config_table)
     if not cfg:
-        merged = {k: v for k, v in {**DEFAULT_CONFIG, **file_cfg}.items() if k in CONFIG_KEYS}
+        merged = {k: v for k, v in {**DEFAULT_CONFIG, **file_cfg}.items() if k in CONFIG_KEYS and k not in SECRET_KEYS}
         safe_insert(config_table, merged)
         return
     if not file_cfg:
@@ -161,6 +162,8 @@ def init_config():
     current = dict(cfg[0])
     updates = {}
     for k in CONFIG_KEYS:
+        if k in SECRET_KEYS:
+            continue
         if k in file_cfg and file_cfg[k] and current.get(k) != file_cfg[k]:
             updates[k] = file_cfg[k]
     if updates:
@@ -173,17 +176,24 @@ def get_config():
         merged = {k: v for k, v in {**DEFAULT_CONFIG, **_read_config_file()}.items() if k in CONFIG_KEYS}
         safe_insert(config_table, merged)
         return dict(merged)
-    return {k: v for k, v in dict(cfg[0]).items() if k in CONFIG_KEYS}
+    result = {k: v for k, v in dict(cfg[0]).items() if k in CONFIG_KEYS}
+    # Secrets never live in the DB — overlay them from the (gitignored) config file
+    file_cfg = _read_config_file()
+    for k in SECRET_KEYS:
+        if file_cfg.get(k):
+            result[k] = file_cfg[k]
+    return result
 
 def save_config(data):
     cfg = safe_all(config_table)
+    db_data = {k: v for k, v in data.items() if k not in SECRET_KEYS}
     if cfg:
         with db_lock:
             config_table.remove(doc_ids=[cfg[0].doc_id])
-            config_table.insert(data)
+            config_table.insert(db_data)
         _invalidate_table_cache("config")
     else:
-        safe_insert(config_table, data)
+        safe_insert(config_table, db_data)
     _write_config_file(data)
 
 init_config()
