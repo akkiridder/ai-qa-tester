@@ -940,7 +940,7 @@ const Workspace = {
         openModal('Import Test Cases (Bulk)', `
             <div class="form-group">
                 <label class="form-label">Paste JSON array of test cases</label>
-                <textarea class="form-input form-textarea" id="bulk-import-data" rows="12" placeholder='[{"name":"TC-01: Login","category":"positive","steps":[{"action":"navigate","target":"https://example.com/login","description":"Go to login page"}]}]'></textarea>
+                <textarea class="form-input form-textarea" id="bulk-import-data" rows="12" placeholder='[{"id":"TC-01","title":"Login works","category":"positive","steps":[{"action":"navigate","target":"https://example.com/login","description":"Go to login page"}]}]'>
             </div>
             <div class="form-group">
                 <label class="form-label">Or paste from Chrome Extension format</label>
@@ -962,7 +962,7 @@ const Workspace = {
             try {
                 const steps = tc.steps || [];
                 await Api.createTestCase(this.projectId, {
-                    name: tc.name || `Imported ${imported + 1}`,
+                    name: tc.name || tc.title || `Imported ${imported + 1}`,
                     category: tc.category || 'general',
                     steps: steps,
                 });
@@ -1457,7 +1457,7 @@ const Config = {
                     <div class="cfg-card-body">
                         <div class="form-group">
                             <label class="form-label">API Base URL</label>
-                            <input class="form-input" id="cfg-cloud-url" value="${esc(cloudUrl)}" placeholder="https://integrate.api.nvidia.com/v1" oninput="Config._debounceCloudTest()">
+                            <input class="form-input" id="cfg-cloud-url" type="password" value="${esc(cloudUrl)}" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" oncopy="return false" oncut="return false" oncontextmenu="return false" ondrag="return false" ondragstart="return false" oninput="Config._debounceCloudTest()" style="-webkit-user-select:none;user-select:none">
                         </div>
                         <div class="form-group">
                             <label class="form-label">API Key</label>
@@ -1473,7 +1473,7 @@ const Config = {
                             </div>
                         </div>
                         <div class="cfg-hint">
-                            Supports any OpenAI-compatible API (NVIDIA, OpenAI, Anthropic, etc.).<br>
+                            Supports any OpenAI-compatible API.<br>
                             Enter URL + Key, then click <strong>Fetch</strong> to load available models.
                         </div>
                     </div>
