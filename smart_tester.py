@@ -448,7 +448,18 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
     if total == 0: return {"status":"pass","steps":[],"passed":0,"adapted":0,"failed":0,"blocked":0,"summary":"No steps"}
 
     # === Pre-flight health check ===
-    health_url = base_url.rstrip("/")
+    # Check the SAME URL the test will actually navigate to (first navigate step),
+    # not base_url, so we never false-alert on a different/flaky host.
+    nav_target = ""
+    for st in steps:
+        if st.get("action", "").lower() in ("navigate", "go to"):
+            t = (st.get("target") or "").strip()
+            if t.startswith("http"):
+                nav_target = t
+            elif st.get("action", "").lower() in ("navigate", "go to"):
+                nav_target = base_url.rstrip("/") + "/" + t.lstrip("/")
+            break
+    health_url = (nav_target or base_url).rstrip("/")
     log_cb("info", f"Site health check: {health_url}")
     
     health_ok = False

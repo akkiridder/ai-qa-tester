@@ -86,11 +86,20 @@ const App = {
 
     init() {
         window.addEventListener('hashchange', () => this._route());
+        this._refreshProjectCount();
         // Restore active run if any
         if (sessionStorage.getItem('activeRun')) {
             Workspace._restoreActiveRun();
         }
         this._route();
+    },
+
+    async _refreshProjectCount() {
+        try {
+            const res = await Api.getProjects();
+            const badge = document.getElementById('sidebar-project-count');
+            if (badge) badge.textContent = (res.data || []).length > 0 ? (res.data || []).length : '';
+        } catch (e) { /* ignore */ }
     },
 
     navigate(page, id, sub) {
@@ -262,6 +271,7 @@ const Projects = {
             const { data } = await Api.createProject({ name, url });
             closeModal();
             toast(`Project "${name}" created`, 'success');
+            App._refreshProjectCount();
             App.navigate('workspace', data._id);
         } catch (e) { toast(e.message, 'error'); }
     },
@@ -302,6 +312,7 @@ const Projects = {
             await Api.deleteProject(id);
             closeModal();
             toast('Project deleted', 'success');
+            App._refreshProjectCount();
             Projects.load();
         } catch (e) { toast(e.message, 'error'); }
     },
@@ -940,7 +951,7 @@ const Workspace = {
         openModal('Import Test Cases (Bulk)', `
             <div class="form-group">
                 <label class="form-label">Paste JSON array of test cases</label>
-                <textarea class="form-input form-textarea" id="bulk-import-data" rows="12" placeholder='[{"id":"TC-01","title":"Login works","category":"positive","steps":[{"action":"navigate","target":"https://example.com/login","description":"Go to login page"}]}]'>
+                <textarea class="form-input form-textarea" id="bulk-import-data" rows="12" placeholder='[{"id":"TC-01","title":"Login works","category":"positive","steps":[{"action":"navigate","target":"https://example.com/login","description":"Go to login page"}]}]'></textarea>
             </div>
             <div class="form-group">
                 <label class="form-label">Or paste from Chrome Extension format</label>
