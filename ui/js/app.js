@@ -327,6 +327,9 @@ const Workspace = {
 
     async load(projectId, sub) {
         this.projectId = projectId;
+        // Clear stale selections from other projects so a bulk delete can't
+        // accidentally remove test cases that belong to a different project.
+        this._selectedTcIds.clear();
         document.querySelectorAll('.page-section').forEach(s => s.style.display = 'none');
         document.getElementById('page-workspace').style.display = 'block';
         document.getElementById('topbar-title').textContent = 'Workspace';
@@ -474,7 +477,8 @@ const Workspace = {
     },
 
     async deleteSelectedTc() {
-        const ids = [...this._selectedTcIds];
+        const validIds = new Set(this.testCases.map(tc => tc._id));
+        const ids = [...this._selectedTcIds].filter(id => validIds.has(id));
         if (ids.length === 0) { toast('No test cases selected', 'warning'); return; }
         if (!confirm(`Delete ${ids.length} selected test case(s)? This cannot be undone.`)) return;
         let ok = 0;
@@ -1015,14 +1019,30 @@ const Workspace = {
     },
 
     _aiDiscovering: false,
+    _discoveryStreamId: null,
+    _discoveryRetryCount: 0,
+    _discoveryRetryTimer: null,
+    _lastDiscoveryCreated: 0,
 
     _reconnectDiscovery() {
-        const stored = sessionStorage.getItem('ai_discovery');
+        const stored = localStorage.getItem('ai_discovery');
         if (!stored) return;
         try {
-            const { projectId, streamId } = JSON.parse(stored);
-            if (projectId !== this.projectId) return;
+            const { projectId, streamId, ts } = JSON.parse(stored);
+            // Only reconnect if this discovery was started recently (within 30 minutes)
+            // to avoid reconnecting to stale/crashed streams
+            if (Date.now() - (ts || 0) > 30 * 60 * 1000) {
+                localStorage.removeItem('ai_discovery');
+                this._resetDiscoveryUI();
+                return;
+            }
+            if (projectId !== this.projectId) {
+                localStorage.removeItem('ai_discovery');
+                return;
+            }
             this._aiDiscovering = true;
+            this._discoveryStreamId = streamId;
+            this._discoveryRetryCount = 0;
             const btn = document.getElementById('ai-discovery-btn');
             const bar = document.getElementById('ai-discovery-progress');
             const status = document.getElementById('ai-discovery-status');
@@ -1030,24 +1050,45 @@ const Workspace = {
             if (bar) bar.classList.add('active');
             if (status) { status.textContent = 'Reconnecting...'; status.classList.add('active'); }
             this._attachDiscoveryStream(streamId, status);
-        } catch { sessionStorage.removeItem('ai_discovery'); }
+        } catch (err) {
+            localStorage.removeItem('ai_discovery');
+            this._resetDiscoveryUI();
+        }
     },
 
     _attachDiscoveryStream(streamId, statusEl) {
-        let resolved = false;
         const src = new EventSource(`/api/run/stream/${streamId}`);
+        let alive = true;
+
         src.addEventListener('progress', (ev) => {
             try {
                 const data = JSON.parse(ev.data);
-                if (statusEl) statusEl.textContent = data.message || '';
+                this._lastDiscoveryCreated = typeof data.count === 'number' ? data.count : this._lastDiscoveryCreated;
+                if (statusEl) {
+                    statusEl.textContent = data.message || '';
+                    // Live update: show generated test case count if provided
+                    if (typeof data.count === 'number' && statusEl) {
+                        statusEl.textContent = (data.message || '') + ` (${data.count} cases)`;
+                    }
+                }
             } catch {}
         });
-        src.addEventListener('complete', () => {
-            resolved = true;
+        src.addEventListener('complete', (ev) => {
+            try {
+                const data = JSON.parse(ev.data || '{}');
+                this._lastDiscoveryCreated = typeof data.created === 'number' ? data.created : this._lastDiscoveryCreated;
+            } catch {}
+            alive = false;
+            clearTimeout(this._discoveryRetryTimer);
             src.close();
-            sessionStorage.removeItem('ai_discovery');
+            localStorage.removeItem('ai_discovery');
+            this._discoveryStreamId = null;
+            this._discoveryRetryCount = 0;
             this._resetDiscoveryUI();
-            toast('AI Discovery completed', 'success');
+            const created = this._lastDiscoveryCreated || 0;
+            const msg = created > 0 ? `AI Discovery completed — ${created} cases created` : 'AI Discovery completed';
+            this._lastDiscoveryCreated = 0;
+            toast(msg, 'success');
             Api.getTestCases(this.projectId).then(({ data }) => {
                 this.testCases = data || [];
                 this._populateTcSelect();
@@ -1057,26 +1098,49 @@ const Workspace = {
         src.addEventListener('error', (ev) => {
             try {
                 const data = JSON.parse(ev.data);
-                resolved = true;
+                alive = false;
+                clearTimeout(this._discoveryRetryTimer);
                 src.close();
-                sessionStorage.removeItem('ai_discovery');
+                localStorage.removeItem('ai_discovery');
+                this._discoveryStreamId = null;
+                this._discoveryRetryCount = 0;
                 this._resetDiscoveryUI();
-                toast('AI Discovery failed: ' + (data.message || ''), 'error');
+                toast('AI Discovery failed: ' + (data.message || 'Server error'), 'error');
             } catch {}
         });
         src.onerror = () => {
-            if (!resolved) {
-                resolved = true;
+            if (!alive) return;
+            alive = false;
+            // Transient connection error — retry with backoff instead of killing discovery.
+            // This is the key fix: a blip on refresh/reconnect should not abandon the run.
+            this._discoveryRetryCount = (this._discoveryRetryCount || 0) + 1;
+            if (this._discoveryRetryCount <= 5) {
+                const delay = Math.min(1000 * this._discoveryRetryCount, 5000);
+                if (statusEl) statusEl.textContent = `Reconnecting (${this._discoveryRetryCount}/5)...`;
+                this._discoveryRetryTimer = setTimeout(() => {
+                    if (this._discoveryStreamId === streamId && this._aiDiscovering) {
+                        src.close();
+                        this._attachDiscoveryStream(streamId, statusEl);
+                    }
+                }, delay);
+            } else {
+                clearTimeout(this._discoveryRetryTimer);
                 src.close();
-                sessionStorage.removeItem('ai_discovery');
+                localStorage.removeItem('ai_discovery');
+                this._discoveryStreamId = null;
+                this._discoveryRetryCount = 0;
                 this._resetDiscoveryUI();
-                toast('AI Discovery connection lost', 'error');
+                toast('AI Discovery connection lost — please restart', 'error');
             }
         };
     },
 
     _resetDiscoveryUI() {
+        clearTimeout(this._discoveryRetryTimer);
         this._aiDiscovering = false;
+        this._discoveryStreamId = null;
+        this._discoveryRetryCount = 0;
+        this._lastDiscoveryCreated = 0;
         const btn = document.getElementById('ai-discovery-btn');
         const bar = document.getElementById('ai-discovery-progress');
         const status = document.getElementById('ai-discovery-status');
@@ -1087,7 +1151,27 @@ const Workspace = {
 
     async generateAITests() {
         if (!this.projectId || this._aiDiscovering) return;
+        // If a discovery is already persisted (e.g. page refreshed mid-run), reconnect instead
+        const existing = localStorage.getItem('ai_discovery');
+        if (existing) {
+            try {
+                const { projectId, streamId } = JSON.parse(existing);
+                if (projectId === this.projectId) {
+                    this._aiDiscovering = true;
+                    this._discoveryStreamId = streamId;
+                    const btn = document.getElementById('ai-discovery-btn');
+                    const bar = document.getElementById('ai-discovery-progress');
+                    const status = document.getElementById('ai-discovery-status');
+                    if (btn) btn.disabled = true;
+                    if (bar) bar.classList.add('active');
+                    if (status) { status.textContent = 'Resuming...'; status.classList.add('active'); }
+                    this._attachDiscoveryStream(streamId, status);
+                    return;
+                }
+            } catch {}
+        }
         this._aiDiscovering = true;
+        this._discoveryRetryCount = 0;
         const btn = document.getElementById('ai-discovery-btn');
         const bar = document.getElementById('ai-discovery-progress');
         const status = document.getElementById('ai-discovery-status');
@@ -1097,7 +1181,8 @@ const Workspace = {
         try {
             const d = await Api.generateAITests(this.projectId);
             const streamId = d.data.streamId;
-            sessionStorage.setItem('ai_discovery', JSON.stringify({ projectId: this.projectId, streamId }));
+            localStorage.setItem('ai_discovery', JSON.stringify({ projectId: this.projectId, streamId, ts: Date.now() }));
+            this._discoveryStreamId = streamId;
             this._attachDiscoveryStream(streamId, status);
         } catch (e) {
             this._resetDiscoveryUI();

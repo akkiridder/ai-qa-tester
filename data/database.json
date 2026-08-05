@@ -2,10 +2,8 @@
   "config": {
     "1": {
       "ai_provider": "cloud",
-      "anthropic_api_key": "",
-      "cloud_api_key": "nvapi-...d5B3",
       "cloud_base_url": "https://integrate.api.nvidia.com/v1",
-      "cloud_model": "qwen/qwen3-next-80b-a3b-instruct",
+      "cloud_model": "meta/llama-3.1-8b-instruct",
       "ollama_base_url": "http://localhost:11434",
       "ollama_model": "qwen2.5-coder:3b"
     }
@@ -27460,6 +27458,204 @@
         }
       ],
       "updatedAt": "2026-06-12T12:52:38.585978Z"
+    },
+    "327": {
+      "_id": "1442dfeb83e74cd5",
+      "category": "positive",
+      "createdAt": "2026-08-05T10:46:32.277402Z",
+      "id": "1442dfeb83e74cd5",
+      "isRegression": true,
+      "name": "Verify Page Title",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 138,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify page title",
+          "target": "text='Example Domain'",
+          "verify": "Page title is correct"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277442Z"
+    },
+    "328": {
+      "_id": "5b54ea97b17c45d8",
+      "category": "positive",
+      "createdAt": "2026-08-05T10:46:32.277465Z",
+      "id": "5b54ea97b17c45d8",
+      "isRegression": true,
+      "name": "Verify Product Listing Page",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 139,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify product listing page message",
+          "target": "text='No products found.'",
+          "verify": "Message is displayed"
+        },
+        {
+          "action": "assert",
+          "description": "Verify product listing page product name",
+          "target": "text='Product 1'",
+          "verify": "Product name is correct"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277472Z"
+    },
+    "329": {
+      "_id": "fa3d19707e984e7d",
+      "category": "positive",
+      "createdAt": "2026-08-05T10:46:32.277486Z",
+      "id": "fa3d19707e984e7d",
+      "isRegression": true,
+      "name": "View Product Detail Page",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 140,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify product detail page product name",
+          "target": "text='Product 1'",
+          "verify": "Product name is correct"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277491Z"
+    },
+    "330": {
+      "_id": "8c05319e9271464b",
+      "category": "positive",
+      "createdAt": "2026-08-05T10:46:32.277504Z",
+      "id": "8c05319e9271464b",
+      "isRegression": true,
+      "name": "Add Product to Cart",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 141,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify cart item count",
+          "target": "text='1 item in cart'",
+          "verify": "Item count is correct"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277508Z"
+    },
+    "331": {
+      "_id": "0006f354d1a74753",
+      "category": "positive",
+      "createdAt": "2026-08-05T10:46:32.277522Z",
+      "id": "0006f354d1a74753",
+      "isRegression": true,
+      "name": "View Cart",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 142,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify cart item count",
+          "target": "text='1 item in cart'",
+          "verify": "Item count is correct"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277527Z"
+    },
+    "332": {
+      "_id": "39eb594a6ff14c4b",
+      "category": "positive",
+      "createdAt": "2026-08-05T10:46:32.277537Z",
+      "id": "39eb594a6ff14c4b",
+      "isRegression": true,
+      "name": "Proceed to Checkout",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 143,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify shipping address field",
+          "target": "text='Shipping Address'",
+          "verify": "Field is displayed"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277541Z"
+    },
+    "333": {
+      "_id": "aa8378412dd54064",
+      "category": "negative",
+      "createdAt": "2026-08-05T10:46:32.277550Z",
+      "id": "aa8378412dd54064",
+      "isRegression": true,
+      "name": "Verify Error Messages",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 144,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "assert",
+          "description": "Verify error message",
+          "target": "text='Search query is required.'",
+          "verify": "Message is correct"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277555Z"
+    },
+    "334": {
+      "_id": "510c6454d8f74858",
+      "category": "negative",
+      "createdAt": "2026-08-05T10:46:32.277563Z",
+      "id": "510c6454d8f74858",
+      "isRegression": true,
+      "name": "Verify Session Expiration",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 145,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "sleep",
+          "description": "Wait for session expiration",
+          "target": "",
+          "verify": "Session is expired"
+        },
+        {
+          "action": "assert",
+          "description": "Verify session expiration message",
+          "target": "text='Session expired. Please login again.'",
+          "verify": "Message is displayed"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277568Z"
+    },
+    "335": {
+      "_id": "4364f1d571584122",
+      "category": "negative",
+      "createdAt": "2026-08-05T10:46:32.277577Z",
+      "id": "4364f1d571584122",
+      "isRegression": true,
+      "name": "Verify CSRF Protection",
+      "projectId": "59ad20d90fcf48c3",
+      "sortOrder": 146,
+      "source": "ai-discovery",
+      "steps": [
+        {
+          "action": "sleep",
+          "description": "Wait for CSRF token expiration",
+          "target": "",
+          "verify": "CSRF token is expired"
+        },
+        {
+          "action": "assert",
+          "description": "Verify CSRF token expiration message",
+          "target": "text='CSRF token is expired. Please refresh the page.'",
+          "verify": "Message is displayed"
+        }
+      ],
+      "updatedAt": "2026-08-05T10:46:32.277581Z"
     },
     "39": {
       "_id": "30d2ea7f6f8a41b4",

@@ -127,7 +127,7 @@ def _write_config_file(data):
     existing.update(payload)
     CONFIG_FILE.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
-def call_ai(prompt, cfg=None, timeout=300):
+def call_ai(prompt, cfg=None, timeout=300, json_mode=False):
     """Call AI provider (Ollama or Cloud API). Returns response text or None."""
     if cfg is None:
         cfg = get_config()
@@ -136,10 +136,12 @@ def call_ai(prompt, cfg=None, timeout=300):
         url = cfg["cloud_base_url"].rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {cfg['cloud_api_key']}", "Content-Type": "application/json"}
         body = {"model": cfg.get("cloud_model", ""), "messages": [{"role": "user", "content": prompt}], "stream": False}
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
         r = requests.post(url, headers=headers, json=body, timeout=timeout)
         if r.status_code == 200:
             return r.json()["choices"][0]["message"]["content"].strip()
-        print(f"[call_ai][cloud] HTTP {r.status_code}: {r.text[:300]}")
+        print(f"[call_ai][cloud] HTTP {r.status_code}: {r.text[:300]}", flush=True)
         return None
     else:
         url = cfg["ollama_base_url"].rstrip("/") + "/api/chat"
@@ -147,7 +149,7 @@ def call_ai(prompt, cfg=None, timeout=300):
         r = requests.post(url, json=body, timeout=timeout)
         if r.status_code == 200:
             return r.json()["message"]["content"].strip()
-        print(f"[call_ai][ollama] HTTP {r.status_code}: {r.text[:300]}")
+        print(f"[call_ai][ollama] HTTP {r.status_code}: {r.text[:300]}", flush=True)
         return None
 
 def init_config():
@@ -166,9 +168,20 @@ def init_config():
             continue
         if k in file_cfg and file_cfg[k] and current.get(k) != file_cfg[k]:
             updates[k] = file_cfg[k]
+        elif k in current and k not in file_cfg:
+            updates[k] = current[k]
     if updates:
-        merged = {k: v for k, v in {**current, **updates}.items() if k in CONFIG_KEYS}
-        save_config(merged)
+        # DB never stores secrets — write only non-secret fields
+        db_data = {k: v for k, v in {**current, **updates}.items() if k in CONFIG_KEYS and k not in SECRET_KEYS}
+        with db_lock:
+            config_table.remove(doc_ids=[cfg[0].doc_id])
+            config_table.insert(db_data)
+        _invalidate_table_cache("config")
+        # config.json keeps the REAL secrets from the file (never a stale DB placeholder)
+        full = {k: v for k, v in file_cfg.items() if k in CONFIG_KEYS}
+        full.update(db_data)
+        _write_config_file(full)
+
 
 def get_config():
     cfg = safe_all(config_table)
@@ -1465,6 +1478,93 @@ def api_generate_tests(pid):
     return ok({"streamId": sid})
 
 
+def _parse_markdown_test_cases(text):
+    """Fallback parser: convert Markdown-style AI output to a list of test case dicts.
+
+    Handles formats like:
+        **Test Case N: Title**
+        **Name:** Foo
+        **Category:** bar
+        **Section:** baz
+        Steps:
+            1. **Action:** click
+               **Target:** #id
+               **Description:** desc
+               **Verify:** verify
+    """
+    if not text:
+        return None
+    cases = []
+    # Split on "Test Case" header markers
+    blocks = re.split(r'^\s*\*\*Test\s*Case\s*[\d:]+\s*:\s*(.+?)\*\*\s*$', text, flags=re.MULTILINE)
+    # re.split with a capturing group interleaves: [preamble, title, body, title, body, ...]
+    if len(blocks) >= 3:
+        for i in range(1, len(blocks), 2):
+            title = blocks[i].strip()
+            body = blocks[i + 1] if i + 1 < len(blocks) else ""
+            cases.append(_parse_markdown_tc(title, body))
+    else:
+        # Single test case without explicit header
+        cases.append(_parse_markdown_tc(None, text))
+    cases = [c for c in cases if c.get("name")]
+    return cases if cases else None
+
+
+def _parse_markdown_tc(title, body):
+    def field(text, name):
+        m = re.search(rf'\*\*{name}:\*\*\s*([^\n*]+)', text, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    tc = {
+        "name": title or field(body, "Name") or "Generated Test Case",
+        "category": field(body, "Category") or "positive",
+        "section": field(body, "Section") or "General",
+        "steps": [],
+    }
+    # Slice the "Steps:" section if present, else use whole body
+    steps_body = body
+    m = re.search(r'Steps:\s*\n', body, re.IGNORECASE)
+    if m:
+        steps_body = body[m.end():]
+    # Split on numbered steps like "1. **Action:** ..."
+    step_parts = re.split(r'(?m)^\s*(\d+)\.\s+\*\*Action:\*\*\s*', steps_body)
+    # step_parts = [preamble, num, text, num, text, ...]
+    idx = 1
+    while idx < len(step_parts):
+        num = step_parts[idx]
+        # text runs until the next numbered step OR next "**Test Case" OR end
+        rest = step_parts[idx + 1] if idx + 1 < len(step_parts) else ""
+        # truncate at the next numbered step start if re-split didn't already
+        nxt = re.search(r'(?m)^\s*\d+\.\s+\*\*Action:\*\*', rest)
+        if nxt:
+            rest = rest[:nxt.start()]
+        action_v = field(rest, "Action") or rest.strip().splitlines()[0] if rest.strip() else ""
+        tc["steps"].append({
+            "action": action_v.strip(),
+            "target": field(rest, "Target"),
+            "description": field(rest, "Description"),
+            "verify": field(rest, "Verify") or field(rest, "Expected"),
+        })
+        idx += 2
+    if not tc["steps"]:
+        act = field(body, "Action")
+        tc["steps"].append({
+            "action": act,
+            "target": field(body, "Target"),
+            "description": field(body, "Description"),
+            "verify": field(body, "Verify") or field(body, "Expected"),
+        })
+    return tc
+
+
+def field_of(text, *names):
+    for name in names:
+        m = re.search(rf'\*\*{name}:\*\*\s*([^\n*]+)', text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def _discovery_worker(pid, base_url, sid):
     def log_cb(level, msg):
         emit_stream(sid, "progress", json.dumps({"message": msg}))
@@ -1536,19 +1636,24 @@ def _discovery_worker(pid, base_url, sid):
                 "20. Data Integrity & System Consistency\n"
                 "21. Performance & Load Testing behaviors\n\n"
                 "INSTRUCTIONS:\n"
-                "1. Generate up to 25 test cases, covering as many of the above areas as possible based on the site and DOM structure.\n"
+                "1. Generate up to 15 test cases, covering as many of the above areas as possible based on the site and DOM structure.\n"
                 "2. If a flow is not present, skip it gracefully and focus on visible user journeys.\n"
                 "3. Use actual DOM selectors from the provided DOM snippet when available. Prefer ID, class, or data-* selectors; otherwise use 'text=' locators.\n"
                 "4. Do not hallucinate unknown fields, forms, or backend details. Use only what can be inferred from the page DOM and URL.\n"
                 "5. Each test case must be valid JSON with keys: name, category, section, steps. Each step must include action, target, description, and verify, and optionally value.\n"
                 "6. Focus on functional validation rather than implementation details. Validate messages, element states, navigation, and secure failure behavior.\n\n"
+                "OUTPUT FORMAT: Return a strict JSON object with a top-level \"test_cases\" key containing an array. Example: {\"test_cases\": [{\"name\":\"...\",\"category\":\"positive\",\"section\":\"General\",\"steps\":[{\"action\":\"navigate\",\"target\":\"$BASE_URL/\",\"description\":\"Open homepage\",\"verify\":\"Page loads\"}]}]}\n"
+                "Do NOT use markdown, bullet points, or prose. Only the JSON object.\n\n"
+
                 f"DOM ELEMENTS: {dom}"
             )
 
             raw_ai = None
             for attempt in range(3):
                 try:
-                    raw_ai = call_ai(prompt, cfg, timeout=300)
+                    # Force JSON mode on the first two attempts; fall back to free-form on the last
+                    use_json = attempt < 2
+                    raw_ai = call_ai(prompt, cfg, timeout=600, json_mode=use_json)
                     if raw_ai:
                         break
                     else:
@@ -1587,19 +1692,36 @@ def _discovery_worker(pid, base_url, sid):
                         generated = None
 
             if generated is None:
-                match = re.search(r"(\[.*\])", raw_ai, re.DOTALL)
-                if match:
-                    try:
-                        generated = json.loads(match.group(1))
-                    except Exception:
-                        generated = None
+                 match = re.search(r"(\[.*\])", raw_ai, re.DOTALL)
+                 if match:
+                     try:
+                         generated = json.loads(match.group(1))
+                     except Exception:
+                         generated = None
 
             if generated is None:
-                print(f"[DEBUG] AI raw output for project {pid}:\n{raw_ai[:4000]}")
+                # Fallback: parse Markdown-style AI output
+                # Expected: "**Test Case N: Title**", fields "**Name:** x", "**Category:** y", "**Section:** z",
+                # and numbered steps with "**Action:**","**Target:**","**Description:**","**Verify:**"
+                generated = _parse_markdown_test_cases(raw_ai)
+
+            if generated is None:
+                print(f"[discovery] Raw AI output (parse failed):\n{raw_ai[:4000]}", flush=True)
                 emit_stream(sid, "error", json.dumps({"message": "AI output could not be parsed as JSON."}))
                 return
 
-            if not isinstance(generated, list): generated = [generated]
+            # Normalize: handle {test_cases:[...]}, {test_case_1:{...}}, or [...]
+            if isinstance(generated, dict):
+                if isinstance(generated.get("test_cases"), list):
+                    generated = generated["test_cases"]
+                else:
+                    # dict keyed test_case_N -> list of values
+                    generated = [v for v in generated.values() if isinstance(v, dict)]
+            if not isinstance(generated, list):
+                generated = [generated]
+            generated = [tc for tc in generated if isinstance(tc, dict) and tc.get("name")]
+            emit_stream(sid, "progress", json.dumps({"message": f"AI generated {len(generated)} test case(s)", "count": len(generated)}))
+            log_cb("info", f"Discovery generated {len(generated)} test cases for project {pid}")
 
             # Selector Validation
             emit_stream(sid, "progress", json.dumps({"message": "Validating selectors..."}))
@@ -1645,8 +1767,9 @@ def _discovery_worker(pid, base_url, sid):
             emit_stream(sid, "error", json.dumps({"message": "AI generated no valid test cases after selector validation."}))
             return
 
-        emit_stream(sid, "progress", json.dumps({"message": f"Saving {len(to_insert)} test cases..."}))
+        emit_stream(sid, "progress", json.dumps({"message": f"Saving {len(to_insert)} test cases...", "count": len(to_insert)}))
         safe_insert_multiple(test_cases_table, to_insert)
+        emit_stream(sid, "progress", json.dumps({"message": f"Live updating: {len(to_insert)} cases added", "count": len(to_insert)}))
         emit_stream(sid, "complete", json.dumps({"created": len(to_insert)}))
 
     except Exception as e:
