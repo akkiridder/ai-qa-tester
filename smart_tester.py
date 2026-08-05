@@ -138,6 +138,7 @@ def call_ai(prompt, cfg=None, timeout=300):
         r = requests.post(url, headers=headers, json=body, timeout=timeout)
         if r.status_code == 200:
             return r.json()["choices"][0]["message"]["content"].strip()
+        print(f"[call_ai][cloud] HTTP {r.status_code}: {r.text[:300]}")
         return None
     else:
         url = cfg["ollama_base_url"].rstrip("/") + "/api/chat"
@@ -145,6 +146,7 @@ def call_ai(prompt, cfg=None, timeout=300):
         r = requests.post(url, json=body, timeout=timeout)
         if r.status_code == 200:
             return r.json()["message"]["content"].strip()
+        print(f"[call_ai][ollama] HTTP {r.status_code}: {r.text[:300]}")
         return None
 
 def init_config():

@@ -24,3 +24,4 @@ api_test_output.txt
 *.pem
 *.crx
 
+config.json
