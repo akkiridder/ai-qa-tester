@@ -734,6 +734,7 @@ const Workspace = {
         document.getElementById('ws-progress-steps').innerHTML = '';
         document.getElementById('ws-progress-result').style.display = 'none';
         document.getElementById('ws-progress-close').style.display = 'none';
+        document.getElementById('ws-progress-cancel').disabled = false;
         const termEl = document.getElementById('ws-terminal-output');
         if (termEl) termEl.textContent = '';
         document.getElementById('ws-terminal').classList.remove('collapsed');
@@ -794,6 +795,7 @@ const Workspace = {
                         panel.style.display = 'block';
                         document.getElementById('ws-progress-label').textContent = `Running: ${name}`;
                         document.getElementById('ws-progress-close').style.display = 'none';
+                        document.getElementById('ws-progress-cancel').disabled = false;
                         const pct = totalSteps > 0 ? Math.min(100, Math.round((this._completedSteps / totalSteps) * 100)) : 0;
                         document.getElementById('ws-progress-bar-fill').style.width = `${pct}%`;
                         this._timerStart = startedAt;
@@ -817,6 +819,7 @@ const Workspace = {
         const label = document.getElementById('ws-progress-label');
         if (label) label.textContent = `${prefix}: ${label.textContent.replace('Running: ', '')}`;
         document.getElementById('ws-progress-close').style.display = 'inline-flex';
+        document.getElementById('ws-progress-cancel').disabled = true;
         this._showResult(ev);
         this._refreshResults();
         this.activeRunId = null;
@@ -1167,6 +1170,7 @@ const Workspace = {
             panel.style.display = 'block';
             document.getElementById('ws-progress-label').textContent = `Running: ${run.testCaseName || 'Test'}`;
             document.getElementById('ws-progress-close').style.display = 'none';
+            document.getElementById('ws-progress-cancel').disabled = false;
             const pct = this._totalSteps > 0 ? Math.min(100, Math.round((this._completedSteps / this._totalSteps) * 100)) : 0;
             document.getElementById('ws-progress-bar-fill').style.width = `${pct}%`;
             this._timerStart = new Date(run.startedAt).getTime();
