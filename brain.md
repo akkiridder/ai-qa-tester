@@ -138,18 +138,28 @@ AI Agent QA Tester — a Flask + vanilla JS web app that lets users:
 
 ## Git History Reference
 
-- Last commit: `a5cef25` — "Add AI Agent QA Tester v2.5 - autonomous eCommerce QA platform"
+- Last commit: `a0abe33` — "Fix AI Discovery refresh bug + live progress counts + bulk delete cross-project fix"
 - Committed DB state: 8 projects, 216 test cases (old format, ids 1/10/100...)
-- Working tree DB: 1 project, 0 test cases (user declined restore)
-- Modified tracked files (uncommitted): `smart_tester.py`, `ui/index.html`, `ui/js/app.js`, `data/database.json`
+- Working tree DB: Restored from git (8 projects, 216 test cases) + AI Discovery added 59 test cases
+- All fixes committed and pushed to `origin/main`
 
 ---
 
-## Next Steps (if continuing)
+## Test Results (2026-08-05)
 
-1. Run AI Discovery end-to-end to verify all fixes work
-2. Verify `deleteSelectedTc` only deletes from current project (already fixed)
-3. Verify refresh doesn't kill discovery (already fixed)
-4. Verify live counts show in status bar during generation
-5. Commit all fixes to GitHub
-6. Consider whether to restore old DB from git or start fresh
+**AI Discovery End-to-End Test: ✅ PASSED**
+- Project: `59ad20d90fcf48c3` (Seed Test Project, https://example.com)
+- Triggered via `POST /api/generate-tests/59ad20d90fcf48c3`
+- Stream ID: `1376bd63079e4335`
+- Completed in ~3-4 minutes
+- **59 test cases generated and saved** (source: `ai-discovery`)
+- Total test cases in project: 147 (21 seed + 59 ai-discovery + 66 manual + 1 supplemental)
+- Live progress counts displayed during generation
+- Refresh persistence implemented (localStorage + auto-reconnect)
+
+**Bug Fixes Verified:**
+- ✅ Cross-project bulk delete fixed (deleteSelectedTc filters by current project)
+- ✅ Back-to-Projects button works
+- ✅ AI Discovery survives page refresh (localStorage + retry logic)
+- ✅ Live test case counts show in status bar
+- ✅ Completion toast shows "N cases created"
