@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <div class="header">
+        <h1>AI QA Recorder</h1>
+        <span id="status-badge" class="badge badge-idle">Idle</span>
+    </div>
+
+    <div class="field">
+        <label>Server URL</label>
+        <input type="text" id="server-url" value="http://localhost:5000" placeholder="http://localhost:5000">
+    </div>
+
+    <div id="controls">
+        <button id="btn-start" class="btn btn-record">Start Recording</button>
+        <button id="btn-stop" class="btn btn-stop" style="display:none">Stop Recording</button>
+    </div>
+
+    <div id="step-counter" style="display:none">
+        <span id="step-count">0</span> steps recorded
+    </div>
+
+    <div id="review-section" style="display:none">
+        <h2>Recorded Steps</h2>
+        <div id="steps-list"></div>
+
+        <div style="display:flex;gap:4px;margin:6px 0">
+            <button id="btn-dedup" class="btn-small">Remove Duplicates</button>
+        </div>
+
+        <div class="save-section">
+            <div class="field">
+                <label>Project</label>
+                <select id="project-select">
+                    <option value="">Loading projects...</option>
+                </select>
+                <button id="btn-new-project" class="btn-small">+ New</button>
+            </div>
+            <div class="field">
+                <label>Test Case Name</label>
+                <input type="text" id="tc-name" placeholder="e.g. Login with valid credentials">
+            </div>
+            <label class="checkbox-field">
+                <input type="checkbox" id="tc-regression" checked> Add to regression suite
+            </label>
+            <div class="btn-group">
+                <button id="btn-save" class="btn btn-save">Save to Project</button>
+                <button id="btn-export" class="btn btn-export">Copy as Markdown</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="new-project-modal" class="modal" style="display:none">
+        <div class="modal-content">
+            <h3>New Project</h3>
+            <div class="field">
+                <label>Project Name</label>
+                <input type="text" id="np-name" placeholder="e.g. My E-Commerce Site">
+            </div>
+            <div class="field">
+                <label>Website URL</label>
+                <input type="text" id="np-url" placeholder="https://example.com">
+            </div>
+            <div class="btn-group">
+                <button id="btn-np-save" class="btn btn-save">Create</button>
+                <button id="btn-np-cancel" class="btn btn-cancel">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast" style="display:none"></div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI QA Tester</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="icon" href="icons/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/styles.css?v=2.0">
+</head>
+<body>
+
+<div class="app-layout">
+
+<aside class="sidebar">
+<a class="sidebar-brand" href="#dashboard" style="text-decoration:none">
+     <span class="brand-icon">⚡</span>
+     <span class="brand-name">AI QA Tester</span>
+   </a>
+  <div class="sidebar-section-label">OVERVIEW</div>
+  <nav class="sidebar-nav">
+    <a class="sidebar-link active" data-page="dashboard" onclick="App.navigate('dashboard')">
+      <span class="sidebar-icon">📊</span> Dashboard
+    </a>
+  </nav>
+  <div class="sidebar-section-label">TESTING</div>
+  <nav class="sidebar-nav">
+    <a class="sidebar-link" data-page="projects" onclick="App.navigate('projects')">
+      <span class="sidebar-icon">🗂</span> Projects
+      <span class="sidebar-badge" id="sidebar-project-count"></span>
+    </a>
+    <a class="sidebar-link" data-page="results" onclick="App.navigate('results')">
+      <span class="sidebar-icon">📋</span> Results
+    </a>
+  </nav>
+  <div class="sidebar-section-label">SYSTEM</div>
+  <nav class="sidebar-nav">
+    <a class="sidebar-link" data-page="settings" onclick="App.navigate('settings')">
+      <span class="sidebar-icon">⚙</span> Settings
+    </a>
+    <a class="sidebar-link" data-page="help" onclick="App.navigate('help')">
+      <span class="sidebar-icon">📖</span> Help & Resources
+    </a>
+  </nav>
+  <div class="sidebar-footer">
+    <div id="queue-status"></div>
+    <div id="sidebar-active-runs"></div>
+  </div>
+</aside>
+
+<div class="main-area">
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="sidebar-toggle" aria-label="Toggle sidebar navigation" onclick="document.body.classList.toggle('sidebar-collapsed')">☰</button>
+      <h1 class="topbar-title" id="topbar-title">Dashboard</h1>
+    </div>
+    <div class="topbar-right">
+      <div class="theme-switcher" role="group" aria-label="Theme selection">
+        <button class="theme-btn active" data-theme="dark" aria-label="Switch to dark theme" onclick="Theme.set('dark')">Dark</button>
+        <button class="theme-btn" data-theme="light" aria-label="Switch to light theme" onclick="Theme.set('light')">Light</button>
+      </div>
+      <div id="global-ai-indicator" class="global-ai-btn" style="display:none">
+        <span class="dot-pulse" style="background:var(--accent-blue)"></span>
+        <span>AI Discovery Active...</span>
+      </div>
+      <div id="global-runs-indicator" class="global-runs-btn" style="display:none" onclick="GlobalRuns.toggle()">
+        <span class="global-runs-dot"></span>
+        <span id="global-runs-count">0 runs active</span>
+      </div>
+      <div id="global-runs-panel" class="global-runs-panel" style="display:none"></div>
+    </div>
+  </header>
+
+  <main class="main-content">
+
+    <!-- DASHBOARD -->
+    <section id="page-dashboard" class="page-section">
+      <div class="stat-cards" id="dash-stats">
+        <div class="stat-card"><div class="stat-card-label">TOTAL PROJECTS</div><div class="stat-card-value" id="ds-projects">—</div><div class="stat-card-sub" id="ds-projects-sub"></div></div>
+        <div class="stat-card"><div class="stat-card-label">TOTAL TEST CASES</div><div class="stat-card-value" id="ds-cases">—</div><div class="stat-card-sub" id="ds-cases-sub"></div></div>
+        <div class="stat-card accent-green"><div class="stat-card-label">PASS RATE</div><div class="stat-card-value" id="ds-passrate">—</div><div class="stat-card-sub" id="ds-passrate-sub"></div></div>
+        <div class="stat-card accent-red"><div class="stat-card-label">TOTAL FAILURES</div><div class="stat-card-value" id="ds-failures">—</div><div class="stat-card-sub" id="ds-failures-sub"></div></div>
+      </div>
+      <div class="dash-grid">
+        <div class="dash-card"><div class="dash-card-header"><span class="dash-card-title">Recent Runs</span></div><div class="dash-card-body" id="dash-recent-runs"><div class="empty-state-sm">Loading...</div></div></div>
+        <div class="dash-card"><div class="dash-card-header"><span class="dash-card-title">Projects Health</span></div><div class="dash-card-body" id="dash-projects-health"><div class="empty-state-sm">Loading...</div></div></div>
+      </div>
+    </section>
+
+    <!-- PROJECTS -->
+    <section id="page-projects" class="page-section" style="display:none">
+      <div class="page-header"><div></div><button class="btn btn-primary" aria-label="Create new project" onclick="Projects.showCreate()">+ New Project</button></div>
+      <div id="projects-grid" class="projects-grid"><div class="empty-state-sm">Loading projects...</div></div>
+    </section>
+
+    <!-- WORKSPACE -->
+    <section id="page-workspace" class="page-section" style="display:none">
+      <div class="workspace-header">
+        <div class="ws-project-info">
+          <span id="ws-project-name" class="ws-name"></span>
+          <a id="ws-project-url" href="#" target="_blank" class="ws-url"></a>
+        </div>
+        <div class="ws-header-actions">
+          <div class="device-switcher" id="ws-device-toggle" role="group" aria-label="Device viewport selection">
+            <button class="device-btn active" data-mode="standard" aria-label="Desktop viewport" onclick="Workspace.setDevice('standard')">💻 Desktop</button>
+            <button class="device-btn" data-mode="mobile" aria-label="Mobile viewport" onclick="Workspace.setDevice('mobile')">📱 Mobile</button>
+            <button class="device-btn" data-mode="both" aria-label="Both viewports" onclick="Workspace.setDevice('both')">🔄 Both</button>
+          </div>
+          <button class="btn btn-sm btn-ghost" onclick="Workspace.editProject()">✎ Edit</button>
+          <span class="ai-discovery-wrap">
+            <button class="btn btn-sm btn-ghost" id="ai-discovery-btn" onclick="Workspace.generateAITests()">🤖 AI Discovery</button>
+            <span class="ai-discovery-bar" id="ai-discovery-progress"></span>
+            <span class="ai-discovery-status" id="ai-discovery-status"></span>
+          </span>
+          <button class="btn btn-sm btn-ghost" onclick="Workspace.importBulk()">📥 Import Bulk</button>
+          <button class="btn btn-sm btn-ghost" onclick="Workspace.addManual()">+ Add Test</button>
+          <button class="btn btn-sm btn-primary" aria-label="Run all test cases" onclick="Workspace.runAllRegression()">▶ Run All</button>
+        </div>
+      </div>
+      <div class="run-panel">
+        <div class="run-section">
+          <div class="run-label">Run a Test Case</div>
+          <div class="run-row">
+            <select id="ws-tc-select" class="run-select"><option value="">— select test case —</option></select>
+            <select id="ws-run-mode" class="run-mode-select">
+              <option value="standard">Standard</option>
+               <option value="graph" selected>Graph (recommended)</option>
+            </select>
+            <button class="btn btn-primary" onclick="Workspace.runTest()">▶ Run</button>
+          </div>
+        </div>
+        <div class="run-divider">or</div>
+        <div class="run-section">
+          <div class="run-label">Run Selected (tick checkboxes below)</div>
+          <div class="run-row">
+            <select id="ws-selected-summary" class="run-select"><option value="">0 selected of 0 test(s) selected</option></select>
+            <button class="btn btn-ghost" onclick="Workspace.selectAllTc()">Select all</button>
+            <button class="btn btn-ghost" onclick="Workspace.clearSelectedTc()">Clear</button>
+            <button id="ws-run-selected-btn" class="btn btn-primary" onclick="Workspace.runSelected()" disabled>▶ Run selected</button>
+          </div>
+        </div>
+      </div>
+      <div id="ws-progress" class="execution-panel" style="display:none">
+        <div class="exec-header">
+          <div class="exec-title"><span class="dot-pulse"></span><span id="ws-progress-label">Running...</span></div>
+          <div class="exec-actions">
+            <span id="ws-progress-timer" class="exec-timer">0s</span>
+            <button id="ws-progress-cancel" class="btn btn-sm btn-danger-outline" onclick="Workspace.cancelRun()">Cancel</button>
+            <button id="ws-progress-close" class="btn btn-sm btn-ghost" onclick="Workspace.closeProgress()" style="display:none">✕ Close</button>
+          </div>
+        </div>
+        <div class="exec-progress-track"><div id="ws-progress-bar-fill" class="exec-progress-fill" style="width:0%"></div></div>
+        <div id="ws-terminal" class="exec-terminal">
+          <div class="exec-terminal-header"><span>Ollama CLI Output</span><button aria-label="Toggle terminal" onclick="Workspace.toggleTerminal()">_</button></div>
+          <pre id="ws-terminal-output" class="exec-terminal-body"></pre>
+        </div>
+        <div id="ws-progress-steps" class="exec-steps"></div>
+        <div id="ws-progress-result" class="exec-result" style="display:none"></div>
+      </div>
+      <div id="ws-analytics"></div>
+      <div class="workspace-grid">
+        <div class="ws-col">
+          <div class="ws-col-header"><span class="ws-col-title">Test Cases</span><span id="ws-tc-count" class="ws-count"></span></div>
+          <div id="ws-test-cases" class="ws-col-body"><div class="empty-state-sm">Loading...</div></div>
+        </div>
+        <div class="ws-col">
+          <div class="ws-col-header"><span class="ws-col-title">Recent Results</span><a href="#results" class="ws-col-link">View all →</a></div>
+          <div id="ws-results-list" class="ws-col-body"><div class="empty-state-sm">Loading...</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RESULTS -->
+    <section id="page-results" class="page-section" style="display:none">
+      <div id="results-content"><div class="empty-state-sm">Loading results...</div></div>
+    </section>
+
+    <!-- RESULT DETAIL -->
+    <section id="page-result-detail" class="page-section" style="display:none">
+      <div class="page-header"><button class="btn btn-ghost" id="result-back-btn" onclick="history.length > 2 ? history.back() : App.navigate('dashboard')">← Back</button><div></div></div>
+      <div id="result-detail-content"></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="page-settings" class="page-section" style="display:none">
+      <div class="page-header"><div></div><button class="btn btn-primary" onclick="Config.save()">💾 Save Config</button></div>
+      <div id="config-content" class="config-container"><div class="empty-state-sm">Loading config...</div></div>
+    </section>
+
+    <!-- HELP -->
+    <section id="page-help" class="page-section" style="display:none">
+      <div class="help-grid">
+        <div class="help-card"><div class="help-card-icon">⚡</div><h3>Quick Start</h3><ol><li>Make sure <strong>Ollama</strong> is running: <code>ollama serve</code></li><li>Pull the model: <code>ollama pull qwen2.5-coder:3b</code></li><li>Create a <strong>Project</strong> with your site URL</li><li>Click <strong>AI Discovery</strong> to auto-generate test cases</li><li>Click <strong>Run All</strong> to execute the full test suite</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">🕵️</div><h3>Tech-Audit</h3><ol><li>Tests capture <strong>Browser Console Errors</strong> automatically</li><li>Hidden <strong>Network Failures</strong> (4xx/5xx) are flagged</li><li>A test <strong>FAILS</strong> if technical errors occur, even if UI looks correct</li><li>View details in the "Tech Logs" tab of any result</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">📱</div><h3>Mobile Emulation</h3><ol><li>Use the <strong>Device Switcher</strong> in the Workspace header</li><li>Choose <strong>Desktop</strong>, <strong>Mobile</strong> (iPhone 13), or <strong>Both</strong></li><li>Both mode runs tests sequentially on each device</li><li>Touch events are simulated for mobile</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">🛠</div><h3>Auto-Healing</h3><ol><li>When a selector breaks, AI analyzes the live DOM</li><li>Finds the best alternative selector automatically</li><li><strong>Permanently updates</strong> the test case in database</li><li>Tests stay valid even after site redesigns</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">▶</div><h3>Run Tests</h3><ol><li>Select a test case from the dropdown</li><li>Choose <strong>Graph</strong> mode (recommended, faster)</li><li>Click <strong>Run</strong> — AI controls Chrome via Playwright</li><li>Watch live terminal + step-by-step results</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">🔄</div><h3>Regression Testing</h3><ol><li>Open a project → click <strong>Run All</strong></li><li>Tests run sequentially with live progress</li><li>Queue shows current test + completion count</li><li>View consolidated pass/fail/adapted results</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">🧩</div><h3>Chrome Extension</h3><ol><li>Open <code>chrome://extensions</code> in Chrome</li><li>Enable <strong>Developer mode</strong></li><li>Click <strong>Load unpacked</code> → select <code>chrome-extension/</code></li><li>Navigate to site → click extension → <strong>Start Recording</strong></li><li>Save recorded flow to project instantly</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">📊</div><h3>Status Meanings</h3><p><strong style="color:var(--success)">PASS</strong> — Step executed as expected</p><p><strong style="color:var(--adapted)">ADAPTED</strong> — AI found alternative approach</p><p><strong style="color:var(--danger)">FAIL</strong> — Step failed or tech error detected</p><p><strong style="color:var(--warning)">BLOCKED</strong> — Could not execute (site down)</p></div>
+      </div>
+    </section>
+
+  </main>
+</div>
+</div>
+
+<div class="modal-overlay" id="modal" style="display:none" onclick="if(event.target.classList.contains('modal-overlay'))closeModal()">
+  <div class="modal-box">
+    <div class="modal-header"><h2 id="modal-title"></h2><button class="modal-close" aria-label="Close modal" onclick="closeModal()">✕</button></div>
+    <div class="modal-body" id="modal-body-content"></div>
+    <div class="modal-footer" id="modal-footer-actions"></div>
+  </div>
+</div>
+
+<div id="lightbox" class="lightbox" style="display:none" onclick="this.style.display='none'">
+  <img id="lightbox-img" src="" alt="Screenshot">
+  <button class="lightbox-close" aria-label="Close lightbox" onclick="document.getElementById('lightbox').style.display='none'">✕</button>
+</div>
+
+<div class="toast-container"></div>
+<!-- Stack of prominent failure popups (top-center) — one per failed run -->
+<div id="fail-alert-stack"></div>
+
+<!-- Live Claude CLI output for the currently-running queue test
+     (only rendered while a regression/multi-select queue is active) -->
+<div id="queue-terminal-panel" style="display:none"></div>
+
+<script src="js/api.js?v=2.0"></script>
+<script src="js/markdown.js?v=2.0"></script>
+<script src="js/app.js?v=2.0"></script>
+</body>
+</html>
