@@ -2217,15 +2217,12 @@ body.light .lightbox { background: rgba(0, 0, 0, 0.75); }
 
 /* ─── QUEUE TERMINAL ──────────────────────────────── */
 #queue-terminal-panel {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    z-index: 80;
+    margin-bottom: 14px;
     background: var(--term-bg);
     color: var(--term-text);
-    border-top: 3px solid var(--border);
-    box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.35);
+    border: 2px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
     font-family: 'JetBrains Mono', monospace;
 }
 #queue-terminal-panel.collapsed .qterm-body { display: none; }

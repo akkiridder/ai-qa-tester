@@ -91,6 +91,17 @@ const Markdown = {
       if (ulMatch || olMatch) {
         const content = ulMatch ? ulMatch[1] : olMatch[1];
         if (inParagraph) { result.push('</p>'); inParagraph = false; }
+        // Ensure a wrapping container (ul/ol) exists before emitting li
+        const type = ulMatch ? 'ul' : 'ol';
+        if (!inList) {
+          result.push('<' + type + '>');
+          inList = true;
+          listType = type;
+        } else if (listType !== type) {
+          result.push('</' + listType + '>');
+          result.push('<' + type + '>');
+          listType = type;
+        }
         result.push('<li>' + content + '</li>');
         continue;
       }

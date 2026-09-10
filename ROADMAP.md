@@ -7,8 +7,12 @@ This document outlines the planned enhancements for the **AI QA Tester** project
 ## ✅ Completed Phases
 - **🚀 Phase 1: Auto-Healing Selectors (Self-Repair)** — System automatically learns and updates failing selectors.
 - **📱 Phase 2: Mobile Emulation Testing** — Run existing test cases on simulated mobile environments.
-- **🕵️ ~~Phase 3: Network & Console Log Analysis~~** — Captures hidden API failures and JS errors during execution.
-- **🤖 ~~Priority 2: AI Discovery (Advanced)~~** — Replaced static Seed QA with dynamic, edge-case-aware site discovery.
+- **🕵️ Phase 3: Network & Console Log Analysis (Tech-Audit)** — Captures hidden API failures and JS errors during execution.
+- **🤖 AI Discovery (Advanced)** — Replaced static Seed QA with dynamic, edge-case-aware site discovery.
+- **🧩 Chrome Extension (Recorder)** — Record browser interactions directly into reusable test cases.
+- **🎨 Theme Engine** — Dark/light theme switching across the UI.
+- **🖥️ Project Workspace** — Dedicated per-project workspace with live terminal, test list, and run controls.
+- **📸 Screenshot Gallery** — Step-by-step screenshot evidence for every run.
 
 ---
 
@@ -36,4 +40,4 @@ This document outlines the planned enhancements for the **AI QA Tester** project
 
 ---
 
-**Current Status:** Phase 3 and AI Test Generation completed. Starting Priority 3 (Scheduled Runs).
+**Current Status:** Phases 1-3, AI Discovery, Chrome Extension, Workspace, Theme Engine and Screenshot Gallery all completed. Next up: Priority 3 (Scheduled Runs).

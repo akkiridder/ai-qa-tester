@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="icon" href="icons/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="css/styles.css?v=2.0">
+<link rel="stylesheet" href="css/styles.css?v=2.4">
 </head>
 <body>
 
@@ -159,6 +159,8 @@
         <div id="ws-progress-steps" class="exec-steps"></div>
         <div id="ws-progress-result" class="exec-result" style="display:none"></div>
       </div>
+      <!-- Live Ollama CLI output for the currently-running queue test -->
+      <div id="queue-terminal-panel" style="display:none"></div>
       <div id="ws-analytics"></div>
       <div class="workspace-grid">
         <div class="ws-col">
@@ -198,7 +200,7 @@
         <div class="help-card"><div class="help-card-icon">🛠</div><h3>Auto-Healing</h3><ol><li>When a selector breaks, AI analyzes the live DOM</li><li>Finds the best alternative selector automatically</li><li><strong>Permanently updates</strong> the test case in database</li><li>Tests stay valid even after site redesigns</li></ol></div>
         <div class="help-card"><div class="help-card-icon">▶</div><h3>Run Tests</h3><ol><li>Select a test case from the dropdown</li><li>Choose <strong>Graph</strong> mode (recommended, faster)</li><li>Click <strong>Run</strong> — AI controls Chrome via Playwright</li><li>Watch live terminal + step-by-step results</li></ol></div>
         <div class="help-card"><div class="help-card-icon">🔄</div><h3>Regression Testing</h3><ol><li>Open a project → click <strong>Run All</strong></li><li>Tests run sequentially with live progress</li><li>Queue shows current test + completion count</li><li>View consolidated pass/fail/adapted results</li></ol></div>
-        <div class="help-card"><div class="help-card-icon">🧩</div><h3>Chrome Extension</h3><ol><li>Open <code>chrome://extensions</code> in Chrome</li><li>Enable <strong>Developer mode</strong></li><li>Click <strong>Load unpacked</code> → select <code>chrome-extension/</code></li><li>Navigate to site → click extension → <strong>Start Recording</strong></li><li>Save recorded flow to project instantly</li></ol></div>
+        <div class="help-card"><div class="help-card-icon">🧩</div><h3>Chrome Extension</h3><ol><li>Open <code>chrome://extensions</code> in Chrome</li><li>Enable <strong>Developer mode</strong></li><li>Click <strong>Load unpacked</strong> → select <code>chrome-extension/</code></li><li>Navigate to site → click extension → <strong>Start Recording</strong></li><li>Save recorded flow to project instantly</li></ol></div>
         <div class="help-card"><div class="help-card-icon">📊</div><h3>Status Meanings</h3><p><strong style="color:var(--success)">PASS</strong> — Step executed as expected</p><p><strong style="color:var(--adapted)">ADAPTED</strong> — AI found alternative approach</p><p><strong style="color:var(--danger)">FAIL</strong> — Step failed or tech error detected</p><p><strong style="color:var(--warning)">BLOCKED</strong> — Could not execute (site down)</p></div>
       </div>
     </section>
@@ -224,12 +226,8 @@
 <!-- Stack of prominent failure popups (top-center) — one per failed run -->
 <div id="fail-alert-stack"></div>
 
-<!-- Live Claude CLI output for the currently-running queue test
-     (only rendered while a regression/multi-select queue is active) -->
-<div id="queue-terminal-panel" style="display:none"></div>
-
-<script src="js/api.js?v=2.0"></script>
-<script src="js/markdown.js?v=2.0"></script>
-<script src="js/app.js?v=2.0"></script>
+<script src="js/api.js?v=2.4"></script>
+    <script src="js/markdown.js?v=2.4"></script>
+    <script src="js/app.js?v=2.4"></script>
 </body>
 </html>

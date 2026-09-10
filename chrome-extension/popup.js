@@ -190,9 +190,11 @@ async function saveToProject() {
     if (currentSteps.length === 0) return toast('No steps recorded', true);
 
     const steps = currentSteps.map(s => ({
-        action: s.action + (s.value ? ` "${s.value}"` : ''),
+        action: s.action.replace(/ ".*"$/, ''),
         target: s.target,
-        expected: s.verify || ''
+        description: s.description || '',
+        value: s.value || '',
+        verify: s.verify || ''
     }));
 
     try {

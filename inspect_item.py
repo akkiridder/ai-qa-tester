@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-db_path = Path(r"C:\Users\AkshayKumar Dudhwala\AI Agent QA\data\database.json")
+db_path = Path(__file__).parent / "data" / "database.json"
 with open(db_path, 'r', encoding='utf-8') as f:
     db = json.load(f)
 

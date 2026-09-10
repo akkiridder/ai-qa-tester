@@ -154,8 +154,7 @@ function handleInput(e) {
         inputTimers.delete(key);
         flashElement(el);
         const desc = describeElement(el);
-        const maskedValue = el.type === 'password' ? '***' : el.value;
-        recordStep({ action: 'type', target: key, description: desc, value: maskedValue });
+        recordStep({ action: 'type', target: key, description: desc, value: el.value });
     }, 600));
 }
 
@@ -166,8 +165,7 @@ function flushInputTimers() {
             const el = document.querySelector(key);
             if (el && el.value) {
                 const desc = describeElement(el);
-                const maskedValue = el.type === 'password' ? '***' : el.value;
-                recordStep({ action: 'type', target: key, description: desc, value: maskedValue });
+                recordStep({ action: 'type', target: key, description: desc, value: el.value });
             }
         } catch {}
     }

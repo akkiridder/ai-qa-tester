@@ -80,7 +80,7 @@ const Api = {
         return this.request(`projects/${id}/dashboard`);
     },
 
-    // Test Cases (MongoDB)
+    // Test Cases (TinyDB)
     async getTestCases(projectId) {
         return this.request(`projects/${projectId}/test-cases`);
     },
@@ -103,7 +103,7 @@ const Api = {
         return this.request(`test-cases/${id}/export`);
     },
 
-    // Project Results (MongoDB)
+    // Project Results (TinyDB)
     async getProjectResults(projectId) {
         return this.request(`projects/${projectId}/results`);
     },

@@ -36,6 +36,8 @@ const SECTION_OPTIONS = [
 
 function _inferSection(name) {
     const n = String(name || '').toLowerCase();
+    // IMPORTANT: Order matters! More specific patterns must come before less specific ones.
+    // e.g., 'Mini Cart' before 'Cart', 'Checkout' before 'Cart'
     const rules = [
         [/\b(homepage|home page|home\b|landing)\b|\bpage loads\b/, 'Homepage'],
         [/\bmini ?cart\b|\bminicart\b/, 'Mini Cart'],
@@ -357,26 +359,10 @@ const Workspace = {
     },
 
     editProject() {
-        const p = this.project;
-        if (!p) return;
-        openModal('Edit Project', `
-            <div class="form-group"><label class="form-label">Project Name</label><input class="form-input" id="edit-proj-name" value="${esc(p.name)}" autofocus></div>
-            <div class="form-group"><label class="form-label">Base URL</label><input class="form-input" id="edit-proj-url" value="${esc(p.url || '')}" type="url"></div>
-            <div class="form-group"><label class="form-label">Platform / Folder Label</label><input class="form-input" id="edit-proj-platform" value="${esc(p.platform || '')}" placeholder="e.g. Shopify, WooCommerce"></div>
-        `, `<button class="btn btn-primary" onclick="Workspace._saveEdit()">Save</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button>`);
-    },
-
-    async _saveEdit() {
-        const name = document.getElementById('edit-proj-name').value.trim();
-        const url = document.getElementById('edit-proj-url').value.trim();
-        const platform = document.getElementById('edit-proj-platform').value.trim();
-        if (!name) { toast('Name is required', 'warning'); return; }
-        try {
-            await Api.updateProject(this.projectId, { name, url, platform });
-            closeModal();
-            toast('Project updated', 'success');
-            this.load(this.projectId);
-        } catch (e) { toast(e.message, 'error'); }
+        // Delegate to Projects._showEdit to avoid code duplication
+        if (this.projectId) {
+            Projects._showEdit(this.projectId);
+        }
     },
 
     _populateTcSelect() {
@@ -736,7 +722,7 @@ const Workspace = {
         if (this._sseSource) { this._sseSource.close(); this._sseSource = null; }
         this.activeRunId = null;
         const dot = document.querySelector('.dot-pulse');
-        if (dot) { dot.style.animation = 'none'; dot.style.background = 'var(--warning)'; }
+        if (dot) { dot.style.animation = ''; dot.style.background = 'var(--warning)'; }
         const label = document.getElementById('ws-progress-label');
         if (label) label.textContent = `Cancelled: ${label.textContent.replace('Running: ', '')}`;
         this._appendTerminal(''); this._appendTerminal('$ Cancelled by user');
@@ -842,7 +828,7 @@ const Workspace = {
         sessionStorage.removeItem('activeRun');
         document.getElementById('ws-progress-bar-fill').style.width = '100%';
         const dot = document.querySelector('.dot-pulse');
-        if (dot) { dot.style.animation = 'none'; dot.style.background = dotColor; }
+        if (dot) { dot.style.animation = ''; dot.style.background = dotColor; }
         const label = document.getElementById('ws-progress-label');
         if (label) label.textContent = `${prefix}: ${label.textContent.replace('Running: ', '')}`;
         document.getElementById('ws-progress-close').style.display = 'inline-flex';
@@ -981,7 +967,8 @@ const Workspace = {
         openModal('Import Test Cases (Bulk)', `
             <div class="form-group">
                 <label class="form-label">Paste JSON array of test cases</label>
-                <textarea class="form-input form-textarea" id="bulk-import-data" rows="12" placeholder='[{"id":"TC-01","title":"Login works","category":"positive","steps":[{"action":"navigate","target":"https://example.com/login","description":"Go to login page"}]}]'></textarea>
+                <textarea class="form-input form-textarea" id="bulk-import-data" rows="12" placeholder='Format 1: [{"name":"Login","category":"positive","steps":[{"action":"navigate","target":"https://example.com"}]}]
+Format 2: [{"test_case_id":"TC001","feature":"Login","description":"Verify login","steps":["1. Navigate to page","2. Click button"],"expected_result":"Logged in"}]'></textarea>
             </div>
             <div class="form-group">
                 <label class="form-label">Or paste from Chrome Extension format</label>
@@ -991,27 +978,101 @@ const Workspace = {
     },
 
     async _saveBulkImport() {
-        const rawJson = document.getElementById('bulk-import-data').value.trim();
-        const rawExt = document.getElementById('bulk-import-ext').value.trim();
+        const el1 = document.getElementById('bulk-import-data');
+        const el2 = document.getElementById('bulk-import-ext');
+        const rawJson = (el1?.value || '').trim();
+        const rawExt = (el2?.value || '').trim();
         const raw = rawJson || rawExt;
         if (!raw) { toast('Paste test case data first', 'warning'); return; }
+        
+        // Input size validation (prevent DoS)
+        const MAX_IMPORT_SIZE = 1024 * 1024; // 1MB
+        if (raw.length > MAX_IMPORT_SIZE) {
+            toast('Import data too large (max 1MB)', 'error');
+            return;
+        }
+        
         let cases;
-        try { cases = JSON.parse(raw); } catch { toast('Invalid JSON', 'error'); return; }
+        try { cases = JSON.parse(raw); } catch (e) { toast('Invalid JSON: ' + e.message, 'error'); return; }
         if (!Array.isArray(cases)) cases = [cases];
+        
+        // Limit number of test cases
+        const MAX_TEST_CASES = 100;
+        if (cases.length > MAX_TEST_CASES) {
+            toast(`Too many test cases (max ${MAX_TEST_CASES}). Only first ${MAX_TEST_CASES} will be imported.`, 'warning');
+            cases = cases.slice(0, MAX_TEST_CASES);
+        }
+
+        function matchSelector(desc, selectors) {
+            const entries = Object.entries(selectors);
+            const lower = desc.toLowerCase();
+            for (const [key, value] of entries) {
+                const keyNorm = key.toLowerCase().replace(/[_-]/g, ' ');
+                const words = lower.split(/\s+/).filter(w => w.length > 3);
+                if (words.some(w => keyNorm.includes(w) || keyNorm.includes(w + 's') || keyNorm.includes(w.slice(0, -1))) ||
+                    words.some(w => key.includes(w))) return value;
+            }
+            return '';
+        }
+
         let imported = 0;
         for (const tc of cases) {
             try {
-                const steps = tc.steps || [];
-                await Api.createTestCase(this.projectId, {
-                    name: tc.name || tc.title || `Imported ${imported + 1}`,
-                    category: tc.category || 'general',
-                    steps: steps,
-                });
+                let steps = tc.steps || [];
+                const selectors = tc.selectors || {};
+
+                if (steps.length > 0 && typeof steps[0] === 'string') {
+                    steps = steps.map((s, i) => {
+                        const desc = s.replace(/^\d+\.\s*/, '').trim();
+                        const lower = desc.toLowerCase();
+                        let action = 'verify';
+                        let target = '';
+                        let expected = tc.expected_result || '';
+
+                        // Handle compound steps: "Click X and verify Y"
+                        const andVerify = lower.includes(' and verify');
+                        const mainDesc = andVerify ? desc.substring(0, desc.toLowerCase().indexOf(' and verify')).trim() : desc;
+                        const verifyPart = andVerify ? desc.substring(desc.toLowerCase().indexOf(' and verify') + 5).trim() : '';
+                        if (verifyPart && !expected) expected = verifyPart.charAt(0).toUpperCase() + verifyPart.slice(1);
+
+                        const mainLower = mainDesc.toLowerCase();
+
+                        if (mainLower.startsWith('navigate') || mainLower.startsWith('go to')) {
+                            action = 'navigate';
+                            target = '';
+                        } else if (mainLower.startsWith('click') || mainLower.includes('click on') || mainLower.includes('click the')) {
+                            action = 'click';
+                            target = matchSelector(mainDesc, selectors) || matchSelector(desc, selectors);
+                        } else if (mainLower.startsWith('enter') || mainLower.startsWith('type') || mainLower.startsWith('fill') || mainLower.includes('enter a') || mainLower.includes('enter the')) {
+                            action = 'fill';
+                            target = matchSelector(mainDesc, selectors) || matchSelector(desc, selectors);
+                        } else if (mainLower.startsWith('scroll') || mainLower.includes('scroll to')) {
+                            action = 'scroll';
+                            target = 'down 500';
+                        } else if (mainLower.startsWith('hover') || mainLower.includes('hover over')) {
+                            action = 'hover';
+                            target = matchSelector(mainDesc, selectors) || matchSelector(desc, selectors);
+                        } else if (mainLower.startsWith('select') || mainLower.includes('choose')) {
+                            action = 'click';
+                            target = matchSelector(mainDesc, selectors) || matchSelector(desc, selectors);
+                        } else {
+                            action = 'verify';
+                            target = matchSelector(desc, selectors) || `text=${desc.split('.').pop().trim()}`;
+                        }
+
+                        if (action === 'navigate' && !target) target = '';
+
+                        return { action, target, description: desc, expected: expected || desc, verify: verifyPart || '', seq: i + 1 };
+                    });
+                }
+                const name = tc.name || tc.title || tc.feature || tc.test_case_id || `Imported ${imported + 1}`;
+                const category = tc.category || tc.feature || 'general';
+                await Api.createTestCase(this.projectId, { name, category, steps });
                 imported++;
             } catch (e) { console.warn('Import skip:', e); }
         }
         closeModal();
-        toast(`Imported ${imported} test case(s)`, 'success');
+        toast(`Imported ${imported} test case(s)`, imported > 0 ? 'success' : 'warning');
         const tcRes = await Api.getTestCases(this.projectId);
         this.testCases = tcRes.data || [];
         this._populateTcSelect();
@@ -1050,6 +1111,14 @@ const Workspace = {
             if (bar) bar.classList.add('active');
             if (status) { status.textContent = 'Reconnecting...'; status.classList.add('active'); }
             this._attachDiscoveryStream(streamId, status);
+            // Safety: if reconnect doesn't resolve within 3 minutes, force-reset
+            this._discoveryReconnectTimer = setTimeout(() => {
+                if (this._aiDiscovering) {
+                    console.warn('[AI Discovery] Reconnect timeout — forcing reset');
+                    localStorage.removeItem('ai_discovery');
+                    this._resetDiscoveryUI();
+                }
+            }, 3 * 60 * 1000);
         } catch (err) {
             localStorage.removeItem('ai_discovery');
             this._resetDiscoveryUI();
@@ -1137,6 +1206,7 @@ const Workspace = {
 
     _resetDiscoveryUI() {
         clearTimeout(this._discoveryRetryTimer);
+        clearTimeout(this._discoveryReconnectTimer);
         this._aiDiscovering = false;
         this._discoveryStreamId = null;
         this._discoveryRetryCount = 0;
@@ -1150,7 +1220,15 @@ const Workspace = {
     },
 
     async generateAITests() {
-        if (!this.projectId || this._aiDiscovering) return;
+        if (!this.projectId) return;
+        // If stuck in discovering state (e.g. stale reconnect), force-reset so user can retry
+        if (this._aiDiscovering) {
+            console.warn('[AI Discovery] Stuck in progress — force resetting');
+            localStorage.removeItem('ai_discovery');
+            this._resetDiscoveryUI();
+            toast('Previous discovery was stuck — reset. Click AI Discovery again.', 'warning');
+            return;
+        }
         // If a discovery is already persisted (e.g. page refreshed mid-run), reconnect instead
         const existing = localStorage.getItem('ai_discovery');
         if (existing) {
@@ -2366,11 +2444,25 @@ const FailAlert = {
     },
 };
 
-function esc(str) { return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function esc(str) { return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function escAttr(str) { return String(str ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 
 function renderMarkdown(md) {
     if (typeof Markdown !== 'undefined') return Markdown.render(md);
-    return md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/^#{3}\s(.+)$/gm, '<h3>$1</h3>').replace(/^#{2}\s(.+)$/gm, '<h2>$1</h2>').replace(/^#\s(.+)$/gm, '<h1>$1</h1>')
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+    // Safe fallback: escape HTML first, then apply simple markdown
+    const safe = String(md || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    return safe
+        .replace(/^#####\s(.+)$/gm, '<h5>$1</h5>')
+        .replace(/^####\s(.+)$/gm, '<h4>$1</h4>')
+        .replace(/^###\s(.+)$/gm, '<h3>$1</h3>')
+        .replace(/^##\s(.+)$/gm, '<h2>$1</h2>')
+        .replace(/^#\s(.+)$/gm, '<h1>$1</h1>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        .replace(/\n/g, '<br>');
 }

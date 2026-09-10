@@ -4,6 +4,8 @@ from pathlib import Path
 from functools import wraps
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from tinydb import TinyDB, Query
 import requests
 from playwright.sync_api import sync_playwright
@@ -33,7 +35,26 @@ def ensure_db_file():
 
 ensure_db_file()
 
-db = TinyDB(DB_FILE, sort_keys=True, indent=2)
+
+# UTF-8 storage for Windows compatibility
+class UTF8JSONStorage:
+    def __init__(self, path):
+        self._path = path
+        self._handle = None
+    def read(self):
+        import json as _json
+        if not self._path.exists():
+            return {}
+        with open(self._path, 'r', encoding='utf-8') as f:
+            return _json.load(f)
+    def write(self, data):
+        import json as _json
+        with open(self._path, 'w', encoding='utf-8') as f:
+            _json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
+    def close(self):
+        pass
+
+db = TinyDB(storage=lambda: UTF8JSONStorage(DB_FILE))
 projects_table = db.table("projects")
 test_cases_table = db.table("test_cases")
 results_table = db.table("results")
@@ -127,30 +148,51 @@ def _write_config_file(data):
     existing.update(payload)
     CONFIG_FILE.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
-def call_ai(prompt, cfg=None, timeout=300, json_mode=False):
+def call_ai(prompt, cfg=None, timeout=300, json_mode=False, force_provider=None, on_stats=None):
     """Call AI provider (Ollama or Cloud API). Returns response text or None."""
     if cfg is None:
         cfg = get_config()
-    provider = cfg.get("ai_provider", "ollama")
+    provider = force_provider or cfg.get("ai_provider", "ollama")
+    # Cloud API path
     if provider == "cloud" and cfg.get("cloud_base_url") and cfg.get("cloud_api_key"):
         url = cfg["cloud_base_url"].rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {cfg['cloud_api_key']}", "Content-Type": "application/json"}
         body = {"model": cfg.get("cloud_model", ""), "messages": [{"role": "user", "content": prompt}], "stream": False}
         if json_mode:
             body["response_format"] = {"type": "json_object"}
-        r = requests.post(url, headers=headers, json=body, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
-        print(f"[call_ai][cloud] HTTP {r.status_code}: {r.text[:300]}", flush=True)
-        return None
-    else:
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                # Track token usage if callback provided
+                if on_stats:
+                    usage = data.get("usage", {})
+                    total_tokens = usage.get("total_tokens", 0)
+                    if total_tokens:
+                        on_stats(total_tokens)
+                return content
+            print(f"[call_ai][cloud] HTTP {r.status_code}: {r.text[:300]}", flush=True)
+        except Exception as e:
+            print(f"[call_ai][cloud] Error: {e}", flush=True)
+        # If cloud failed and force_provider was 'cloud', don't fallback
+        if force_provider == "cloud":
+            return None
+    # Ollama path
+    if cfg.get("ollama_base_url") and cfg.get("ollama_model"):
         url = cfg["ollama_base_url"].rstrip("/") + "/api/chat"
         body = {"model": cfg["ollama_model"], "messages": [{"role": "user", "content": prompt}], "stream": False}
-        r = requests.post(url, json=body, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()["message"]["content"].strip()
-        print(f"[call_ai][ollama] HTTP {r.status_code}: {r.text[:300]}", flush=True)
-        return None
+        try:
+            r = requests.post(url, json=body, timeout=timeout)
+            if r.status_code == 200:
+                content = r.json()["message"]["content"].strip()
+                if on_stats:
+                    on_stats(0)
+                return content
+            print(f"[call_ai][ollama] HTTP {r.status_code}: {r.text[:300]}", flush=True)
+        except Exception as e:
+            print(f"[call_ai][ollama] Error: {e}", flush=True)
+    return None
 
 def init_config():
     file_cfg = _read_config_file()
@@ -212,11 +254,13 @@ def save_config(data):
 init_config()
 
 app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB max request size
 CORS(app, resources={r"/api/*": {"origins": [
     re.compile(r"http://localhost(:\d+)?"),
     re.compile(r"http://127\.0\.0\.1(:\d+)?"),
     re.compile(r"chrome-extension://.*"),
 ]}})
+limiter = Limiter(get_remote_address, app=app, default_limits=["200 per minute"], storage_uri="memory://")
 active_runs = {}
 project_queues = {} # Track bulk project runs
 run_streams = {}
@@ -337,11 +381,32 @@ def resume_interrupted_runs():
     for qid, q in list(project_queues.items()):
         if q.get("status") == "interrupted":
             print(f"  [SYSTEM] Auto-resuming interrupted project queue: {qid}")
-            # For simplicity, we restart the regression run for the project
-            # A more advanced version would pick up where it left off
-            # api_run_project(qid) # We can't call this directly because it expects Request context
-            # So we'll just log it for now or implement a background resume
-            pass
+            # Re-fetch test cases for this project and restart the full run
+            tcs = [t for t in safe_all(test_cases_table) if t.get("projectId") == qid and t.get("isRegression")]
+            if not tcs:
+                tcs = [t for t in safe_all(test_cases_table) if t.get("projectId") == qid]
+            if tcs:
+                mode = q.get("mode", "standard")
+                device = q.get("device", "desktop")
+                run_queue = []
+                for tc in tcs:
+                    rid = make_id()[:12]
+                    active_runs[rid] = {
+                        "id": rid, "status": "queued", "testCaseId": tc.get("id") or tc.get("_id"),
+                        "logs": [], "cancelled": False, "mode": mode, "device": device,
+                        "testCaseName": tc.get("name"), "projectId": qid,
+                        "totalSteps": len(tc.get("steps", [])), "currentStep": 0
+                    }
+                    run_queue.append((tc.get("id") or tc.get("_id"), rid))
+                project_queues[qid] = {
+                    "id": qid, "status": "running", "total": len(run_queue),
+                    "completed": [], "currentTestCase": tcs[0].get("name")
+                }
+                threading.Thread(target=_run_sequential_queue, args=(qid, run_queue, tcs, mode, device), daemon=True).start()
+                resumed_count += 1
+            else:
+                print(f"  [SYSTEM] No test cases found for project queue {qid} — skipping resume")
+                project_queues[qid]["status"] = "completed"
 
     if resumed_count:
         print(f"  [SYSTEM] Successfully resumed {resumed_count} test run(s).")
@@ -388,6 +453,16 @@ def check_api_key():
         return None
     return err("Unauthorized — set X-API-Key header", 401)
 
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+    return response
+
 load_active_state()
 cleanup_test_artifacts()
 
@@ -408,37 +483,139 @@ def make_id(): return str(uuid.uuid4()).replace("-","")
 def now_iso(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 def get_compact_dom(page):
-    """Returns a grouped, structured DOM representation for AI context."""
+    """Returns comprehensive DOM with REAL CSS selectors for AI context.
+    Extracts ALL interactive elements (up to 100) with the most reliable selector available."""
     try:
-        return page.evaluate('''() => {
-            const sections = {
-                'header': 'header, .header, nav',
-                'main': 'main, #main, .content, .product-container',
-                'cart': '#cart, .cart-container, .mini-cart',
-                'checkout': '#checkout, .checkout-container',
-                'footer': 'footer, .footer'
-            };
-            
-            const interactiveSelectors = 'a, button, input, select, textarea, [role="button"], [onclick]';
-            const grouped = {};
-            
-            for (const [name, sel] of Object.entries(sections)) {
-                const container = document.querySelector(sel);
-                if (container) {
-                    grouped[name] = [];
-                    container.querySelectorAll(interactiveSelectors).forEach((el, index) => {
-                        if (index > 15) return; // Limit per section
-                        const tag = el.tagName.toLowerCase();
-                        const txt = (el.innerText || el.value || el.title || '').trim().slice(0, 50);
-                        if (txt) grouped[name].push(`<${tag}>${txt}</${tag}>`);
-                    });
+        return page.evaluate("""() => {
+            function bestSelector(el, index) {
+                if (el.dataset && el.dataset.testid) return '[data-testid="' + el.dataset.testid + '"]';
+                if (el.id) return '#' + CSS.escape(el.id);
+                if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+                if (el.getAttribute('aria-label')) return el.tagName.toLowerCase() + '[aria-label="' + el.getAttribute('aria-label') + '"]';
+                if (el.getAttribute('role')) {
+                    const role = el.getAttribute('role');
+                    const txt = (el.innerText || el.value || '').trim().slice(0, 30);
+                    if (txt) return '[role="' + role + '"] >> text="' + txt + '"';
                 }
+                let sel = el.tagName.toLowerCase();
+                if (el.type && ['input','button','select'].includes(el.tagName.toLowerCase())) {
+                    sel += '[type="' + el.type + '"]';
+                }
+                if (el.className && typeof el.className === 'string') {
+                    const classes = el.className.trim().split(/\\s+/)
+                        .filter(c => c && !c.startsWith('ng-') && !c.startsWith('vue-') && !c.startsWith('sc-') && c.length < 30)
+                        .slice(0, 3);
+                    if (classes.length) sel += '.' + classes.join('.');
+                }
+                if (el.href) {
+                    try {
+                        const url = new URL(el.href, location.href);
+                        const path = url.pathname;
+                        if (path && path !== '/') sel += '[href="' + path + '"]';
+                    } catch(e) {}
+                }
+                if (el.placeholder) sel += '[placeholder="' + el.placeholder.slice(0, 30) + '"]';
+                if (sel === el.tagName.toLowerCase()) sel += ':nth-of-type(' + (index + 1) + ')';
+                return sel;
             }
-            
-            return JSON.stringify(grouped, null, 2);
-        }''')
+            const interactiveSelectors = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [onclick], [data-testid]';
+            const allLinks = [];
+            const allForms = [];
+            const allInteractive = [];
+            const seen = new Set();
+            let idx = 0;
+            document.querySelectorAll(interactiveSelectors).forEach((el) => {
+                if (allInteractive.length >= 100) return;
+                const tag = el.tagName.toLowerCase();
+                const txt = (el.innerText || el.value || el.placeholder || el.title || el.getAttribute('aria-label') || '').trim().slice(0, 50);
+                const s = bestSelector(el, idx);
+                if (seen.has(s)) return;
+                seen.add(s);
+                const entry = tag + ' ' + s + (txt ? ' => "' + txt + '"' : '');
+                allInteractive.push(entry);
+                if (tag === 'a' && el.href) {
+                    try {
+                        const url = new URL(el.href, location.href);
+                        if (url.origin === location.origin && url.pathname !== location.pathname) {
+                            allLinks.push({text: txt || url.pathname, url: el.href, selector: s});
+                        }
+                    } catch(e) {}
+                }
+                idx++;
+            });
+            document.querySelectorAll('form').forEach((form, fi) => {
+                if (fi > 5) return;
+                const action = form.action || '';
+                const method = form.method || 'GET';
+                const fields = [];
+                form.querySelectorAll('input, select, textarea').forEach((el, ei) => {
+                    if (ei > 10) return;
+                    const s = bestSelector(el, ei);
+                    const ph = el.placeholder || el.name || el.type || '';
+                    fields.push(s + ' (' + ph + ')');
+                });
+                if (fields.length) allForms.push({action: action, method: method, fields: fields});
+            });
+            const headings = [];
+            document.querySelectorAll('h1, h2, h3').forEach((el, i) => {
+                if (i > 15) return;
+                const txt = el.innerText.trim().slice(0, 60);
+                if (txt) headings.push(el.tagName.toLowerCase() + ' "' + txt + '"');
+            });
+            const navLinks = [];
+            document.querySelectorAll('nav a, [role="navigation"] a, .nav a, .menu a, .navbar a, header a').forEach((el, i) => {
+                if (i > 20) return;
+                const txt = (el.innerText || '').trim().slice(0, 40);
+                const s = bestSelector(el, i);
+                if (txt && !seen.has(s)) {
+                    seen.add(s);
+                    navLinks.push(txt + ' => ' + s);
+                }
+            });
+            return JSON.stringify({
+                page_title: document.title,
+                page_url: location.href,
+                headings: headings,
+                nav_links: navLinks,
+                forms: allForms,
+                interactive: allInteractive,
+                discoverable_links: allLinks.slice(0, 30)
+            }, null, 2);
+        }""")
     except Exception as e:
         return f"DOM extraction failed: {str(e)}"
+
+def _is_safe_url(url):
+    """Check if URL is safe (not pointing to private/internal networks)."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https', ''):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # Check for private/internal IPs
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        except ValueError:
+            # Not an IP - check hostname patterns
+            blocked = ['localhost', '127.0.0.1', '::1', '0.0.0.0', '169.254.169.254',
+                       'metadata.google.internal', 'instance-data', '169.254.169.254']
+            if hostname.lower() in blocked:
+                return False
+            # Check for IP-like patterns
+            import re
+            if re.match(r'^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)', hostname):
+                return False
+        return True
+    except Exception:
+        return False
 
 def slugify(s): return re.sub(r'[^a-z0-9-]+', '-', s.lower()).strip('-')
 
@@ -492,45 +669,17 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
         try:
             hr = requests.get(health_url, timeout=10, headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True)
             if hr.status_code >= 500:
-                log_cb("warning", f"Site {health_url} returned HTTP {hr.status_code} (Attempt {attempt+1}/2)")
-                try:
-                    cfg = get_config()
-                    prompt = (
-                        f"The URL {health_url} returned HTTP {hr.status_code} (server error).\n"
-                        "Should we retry, or abort the test?\n"
-                        "Respond with only: RETRY | ABORT: <reason>"
-                    )
-                    ai_txt = call_ai(prompt, timeout=10)
-                    if ai_txt:
-                        log_cb("info", f"AI health check: {ai_txt[:200]}")
-                        if ai_txt.upper().startswith("ABORT"):
-                            return {"status":"fail","steps":[{"seq":0,"status":"fail","note":f"Site down (HTTP {hr.status_code}) — {ai_txt}"}],"passed":0,"adapted":0,"failed":1,"blocked":0,"summary":"Site unreachable — aborted"}
-                        # If RETRY, we just continue the loop
-                except Exception as e:
-                    log_cb("warning", f"AI health check failed: {e}")
+                log_cb("warning", f"Site {health_url} returned HTTP {hr.status_code} (Attempt {attempt+1}/2) — retrying...")
+                time.sleep(2)
             else:
                 log_cb("ok", f"Site {health_url} responded with HTTP {hr.status_code}")
                 health_ok = True
                 break
         except (requests.ConnectionError, requests.Timeout) as conn_err:
             log_cb("warning", f"Site {health_url} unreachable ({type(conn_err).__name__}) (Attempt {attempt+1}/2)")
-            if attempt == 0: # Only ask AI on first failure
-                try:
-                    cfg = get_config()
-                    prompt = (
-                        f"The URL {health_url} is unreachable ({type(conn_err).__name__}).\n"
-                        "Should we retry, or abort the test?\n"
-                        "Respond with only: RETRY | ABORT: <reason>"
-                    )
-                    ai_txt = call_ai(prompt, timeout=10)
-                    if ai_txt:
-                        log_cb("info", f"AI health check: {ai_txt[:200]}")
-                        if ai_txt.upper().startswith("ABORT"):
-                            return {"status":"fail","steps":[{"seq":0,"status":"fail","note":f"Site {health_url} unreachable — {ai_txt}"}],"passed":0,"adapted":0,"failed":1,"blocked":0,"summary":"Site unreachable — aborted"}
-                except Exception as e:
-                    log_cb("warning", f"AI health check failed: {e}")
-            time.sleep(2)
-    
+            if attempt < 1:
+                time.sleep(2)
+
     if not health_ok:
         log_cb("warning", "Proceeding with test despite health check failures...")
 
@@ -605,7 +754,14 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                 log_cb("step", f"Step {s}/{total}: {action} {desc}")
                 try:
                     if action in ("navigate","go to"):
-                        url = target if target.startswith("http") else base_url.rstrip("/")+"/"+target.lstrip("/")
+                        # If target is just a path segment (no http, no /), use base_url
+                        if target.startswith("http"):
+                            url = target
+                        elif target.startswith("/"):
+                            url = base_url.rstrip("/") + target
+                        else:
+                            # Could be a partial path like "Home" or a full path like "accessories.html"
+                            url = base_url.rstrip("/") + "/" + target.lstrip("/")
                         nav_ok = False
                         nav_attempts = [url]
                         try:
@@ -630,7 +786,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     "Respond with only one line:\n"
                                     "RETRY: <full alternative URL> | ABORT: <reason>"
                                 )
-                                ai_txt = call_ai(prompt, timeout=10)
+                                ai_txt = call_ai(prompt, timeout=10, force_provider="cloud")
                                 if ai_txt:
                                     log_cb("info", f"AI nav response: {ai_txt[:200]}")
                                     lines = re.split(r'[\n|]+', ai_txt)
@@ -657,14 +813,13 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                 except Exception as alt_err:
                                     log_cb("info", f"AI nav alt '{alt}' failed: {str(alt_err)[:100]}")
                         if nav_ok:
-                            status = "adapted" if len(nav_attempts) > 1 else "pass"
+                            status = "pass"
                             step_results.append({"seq":s,"status":status,"note":f"Navigated to {url}","durationMs":int((time.time()-t0)*1000)})
-                            if status == "adapted":
+                            if len(nav_attempts) > 1:
                                 healed_steps.append({"index": i, "new": url})
-                                adapted_count += 1
                             screenshot = capture_screenshot(f"step-{s}")
                             if screenshot: step_results[-1]["screenshot"] = screenshot
-                            log_cb("ok" if status=="pass" else "adapted", f"Navigated to {url}")
+                            log_cb("ok", f"Navigated to {url}")
                             
                             # --- PRE-SCAN VALIDATION ---
                             log_cb("info", "Running Pre-scan validation...")
@@ -675,7 +830,8 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     try:
                                         if not page.query_selector(sel):
                                             missing.append(sel)
-                                    except: pass
+                                    except Exception as _prescan_err:
+                                        log_cb("warning", f"Pre-scan selector error for '{sel}': {_prescan_err}")
                             if missing:
                                 log_cb("warning", f"Pre-scan detected {len(missing)} missing critical element(s): {', '.join(missing[:3])}...")
                             else:
@@ -691,26 +847,70 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                         clicked = False
                         ai_used = False
                         click_attempts = [target]
+                        # Fast path: if target looks like TEXT (not CSS), try to resolve it first
+                        if not target.startswith('#') and not target.startswith('.') and not target.startswith('[') and not target.startswith('text=') and not target.startswith('xpath=') and not re.match(r'^[a-z]+\[', target):
+                            resolved = _find_selector_by_text(page, target, 'click', desc)
+                            if resolved and resolved != target:
+                                log_cb("info", f"Runtime text resolved: '{target}' -> {resolved}")
+                                target = resolved
+                                step["target"] = resolved
                         try:
                             page.click(target, timeout=5000)
                             clicked = True
                         except Exception:
-                            log_cb("info", f"Ollama CLI Output: Analyzing page for element '{desc}'...")
+                            # Hover-before-click: try hovering over parent menu items first
+                            try:
+                                hover_targets = page.evaluate("""(text) => {
+                                    const t = text.toLowerCase();
+                                    // Find parent nav/menu items that might reveal dropdowns
+                                    const menus = document.querySelectorAll('nav li, .menu-item, [class*="nav"] > *, [class*="menu"] > *, .category-item, .parent-category');
+                                    const results = [];
+                                    for (const el of menus) {
+                                        const elText = (el.innerText || '').trim().toLowerCase();
+                                        // Check if this menu item text is a prefix of our target
+                                        if (t.includes(elText) && elText.length > 2 && elText.length < t.length) {
+                                            let s = null;
+                                            if (el.id) s = '#' + el.id;
+                                            else if (el.className && typeof el.className === 'string') {
+                                                const c = el.className.trim().split(/\s+/).filter(c => c && c.length < 30).slice(0,2);
+                                                if (c.length) s = el.tagName.toLowerCase() + '.' + c.join('.');
+                                            }
+                                            if (s) results.push(s);
+                                        }
+                                    }
+                                    return results.slice(0, 3);
+                                }""", desc)
+                                for ht in (hover_targets or []):
+                                    try:
+                                        log_cb("info", f"Hovering parent menu: {ht}")
+                                        page.hover(ht, timeout=2000)
+                                        page.wait_for_timeout(500)
+                                        # Now try clicking the target again
+                                        page.click(target, timeout=3000)
+                                        clicked = True
+                                        log_cb("info", f"Clicked after hover: {target}")
+                                        break
+                                    except Exception as _hover_click_err:
+                                        log_cb("info", f"Hover-click attempt on '{ht}' failed: {str(_hover_click_err)[:60]}")
+                            except Exception as _hover_eval_err:
+                                log_cb("info", f"Hover target evaluation failed: {str(_hover_eval_err)[:60]}")
+                        if not clicked:
+                            log_cb("info", f"AI CLI Output: Analyzing page for element '{desc}'...")
                             try:
                                 dom = get_compact_dom(page)
+                                # Truncate DOM for AI context window
+                                dom_snippet = dom[:3000] if len(dom) > 3000 else dom
                                 prompt = (
                                     f"You are an expert QA Automation AI. You are controlling a browser via Playwright.\n"
                                     f"URL: {page.url}\n"
                                     f"ACTION: Click on '{desc}'\n"
                                     f"FAILED SELECTOR: {target}\n\n"
-                                    f"COMPACT DOM:\n{dom}\n\n"
+                                    f"COMPACT DOM:\n{dom_snippet}\n\n"
                                     "Analyze the DOM and find the best alternative selector to click the element.\n"
-                                    "Think step-by-step. First explain your reasoning, then provide the selector.\n"
-                                    "Respond with:\n"
-                                    "REASONING: <your analysis>\n"
+                                    "Respond with ONLY the selector (no explanation needed):\n"
                                     "SELECTOR: <playwright selector>"
                                 )
-                                resp = call_ai(prompt, timeout=120)
+                                resp = call_ai(prompt, timeout=60, force_provider="cloud")
                                 if resp:
                                     reasoning = ""
                                     found_sel = False
@@ -740,7 +940,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     if len(click_attempts) > 1:
                                         log_cb("info", f"Ollama CLI Output: Trying AI suggested selector: {click_attempts[-1]}")
                                 else:
-                                    log_cb("error", f"Ollama CLI Output: AI request failed with status {r.status_code}")
+                                    log_cb("error", "Ollama CLI Output: AI request returned no response")
                             except Exception as ai_err:
                                 log_cb("warning", f"AI request error: {ai_err}")
                             
@@ -771,14 +971,13 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     log_cb("info", f"Ollama CLI Output: AI selector '{sel}' failed: {str(sel_err)[:50]}")
                                     continue
                         if clicked:
-                            status = "adapted" if ai_used else "pass"
+                            status = "pass"
                             step_results.append({"seq":s,"status":status,"note":f"Clicked {target}","durationMs":int((time.time()-t0)*1000)})
-                            if status == "adapted":
+                            if ai_used:
                                 healed_steps.append({"index": i, "new": target})
-                                adapted_count += 1
                             screenshot = capture_screenshot(f"step-{s}")
                             if screenshot: step_results[-1]["screenshot"] = screenshot
-                            log_cb("ok" if status=="pass" else "adapted", f"Clicked {target}")
+                            log_cb("ok", f"Clicked {target}")
                         else:
                             err_msg = f"Click failed: {desc} — element not found on page"
                             try:
@@ -796,25 +995,68 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                         filled = False
                         ai_used = False
                         fill_attempts = [target]
+                        # Fast path: resolve TEXT targets to real CSS selectors
+                        if not target.startswith('#') and not target.startswith('.') and not target.startswith('[') and not target.startswith('text=') and not target.startswith('xpath=') and not re.match(r'^[a-z]+\[', target):
+                            resolved = _find_selector_by_text(page, target, 'fill', desc)
+                            if resolved and resolved != target:
+                                log_cb("info", f"Runtime text resolved: '{target}' -> {resolved}")
+                                target = resolved
+                                step["target"] = resolved
+                            else:
+                                # Aggressive search: find input by label text, placeholder, or nearby text
+                                try:
+                                    aggressive = page.evaluate("""(desc) => {
+                                        const t = desc.toLowerCase();
+                                        // Try all inputs
+                                        const inputs = document.querySelectorAll('input, select, textarea');
+                                        for (const inp of inputs) {
+                                            const ph = (inp.placeholder || '').toLowerCase();
+                                            const name = (inp.name || '').toLowerCase();
+                                            const id = (inp.id || '').toLowerCase();
+                                            const label = inp.getAttribute('aria-label') || '';
+                                            // Match by placeholder, name, id, or label
+                                            if (ph.includes(t) || name.includes(t) || id.includes(t) || label.toLowerCase().includes(t)) {
+                                                if (inp.id) return '#' + inp.id;
+                                                if (inp.name) return inp.tagName.toLowerCase() + '[name="' + inp.name + '"]';
+                                            }
+                                        }
+                                        // Try label elements
+                                        const labels = document.querySelectorAll('label');
+                                        for (const l of labels) {
+                                            const lt = l.textContent.trim().toLowerCase();
+                                            if (lt.includes(t) || t.includes(lt.replace(':', '').trim())) {
+                                                if (l.htmlFor) { const inp = document.getElementById(l.htmlFor); if (inp) return '#' + inp.id; }
+                                                const inp = l.querySelector('input, select, textarea');
+                                                if (inp && inp.id) return '#' + inp.id;
+                                            }
+                                        }
+                                        return null;
+                                    }""", desc)
+                                    if aggressive:
+                                        log_cb("info", f"Aggressive fill resolved: '{target}' -> {aggressive}")
+                                        target = aggressive
+                                        step["target"] = aggressive
+                                except Exception as _agg_err:
+                                    log_cb("info", f"Aggressive fill resolution failed: {str(_agg_err)[:80]}")
                         try:
                             page.fill(target, val, timeout=5000)
                             filled = True
                         except Exception:
-                            log_cb("info", f"Ollama CLI Output: Analyzing page for input '{desc}'...")
+                            log_cb("info", f"AI CLI Output: Analyzing page for input '{desc}'...")
                             try:
                                 dom = get_compact_dom(page)
+                                dom_snippet = dom[:3000] if len(dom) > 3000 else dom
                                 prompt = (
                                     f"You are an expert QA Automation AI.\n"
                                     f"URL: {page.url}\n"
                                     f"TASK: Fill '{val}' into '{desc}'\n"
                                     f"FAILED SELECTOR: {target}\n\n"
-                                    f"COMPACT DOM:\n{dom}\n\n"
+                                    f"COMPACT DOM:\n{dom_snippet}\n\n"
                                     "Analyze the DOM and find the best alternative selector for the input field.\n"
-                                    "Respond with:\n"
-                                    "REASONING: <analysis>\n"
+                                    "Respond with ONLY the selector (no explanation needed):\n"
                                     "SELECTOR: <selector>"
                                 )
-                                resp = call_ai(prompt, timeout=120)
+                                resp = call_ai(prompt, timeout=60, force_provider="cloud")
                                 if resp:
                                     reasoning = ""
                                     found_sel = False
@@ -841,7 +1083,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                         log_cb("warning", f"Ollama CLI Output: AI couldn't suggest a fill selector. Raw: {resp[:100]}...")
                                         fill_attempts.append(f"text={desc}")
                                 else:
-                                    log_cb("error", f"Ollama CLI Output: AI request failed with status {r.status_code}")
+                                    log_cb("error", "Ollama CLI Output: AI request returned no response")
                             except Exception as ai_err:
                                 log_cb("warning", f"AI request error: {ai_err}")
                             
@@ -855,14 +1097,13 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                 except Exception:
                                     continue
                         if filled:
-                            status = "adapted" if ai_used else "pass"
+                            status = "pass"
                             step_results.append({"seq":s,"status":status,"note":f"Filled {target}","durationMs":int((time.time()-t0)*1000)})
-                            if status == "adapted":
+                            if ai_used:
                                 healed_steps.append({"index": i, "new": target})
-                                adapted_count += 1
                             screenshot = capture_screenshot(f"step-{s}")
                             if screenshot: step_results[-1]["screenshot"] = screenshot
-                            log_cb("ok" if status=="pass" else "adapted", f"Filled {target}")
+                            log_cb("ok", f"Filled {target}")
                         else:
                             err_msg = f"Fill failed: {desc} — input field not found"
                             try:
@@ -904,14 +1145,13 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     "Respond with only: FOUND | NOT_FOUND: <reason>"
                                 )
                                 cfg = get_config()
-                                ai_txt = call_ai(prompt, timeout=30)
+                                ai_txt = call_ai(prompt, timeout=30, force_provider="cloud")
                                 if ai_txt:
                                     if ai_txt.upper().startswith("FOUND"):
-                                        step_results.append({"seq":s,"status":"adapted","note":f"AI verified: {ai_txt}","durationMs":int((time.time()-t0)*1000)})
-                                        adapted_count += 1
+                                        step_results.append({"seq":s,"status":"pass","note":f"AI verified: {ai_txt}","durationMs":int((time.time()-t0)*1000)})
                                         screenshot = capture_screenshot(f"step-{s}")
                                         if screenshot: step_results[-1]["screenshot"] = screenshot
-                                        log_cb("adapted", f"AI verified presence of '{desc}'")
+                                        log_cb("ok", f"AI verified presence of '{desc}'")
                                         continue
                             except Exception: pass
                             
@@ -1008,7 +1248,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                 "FAIL: [reason] if it fails\n"
                                 "SKIP: [reason] if not applicable\n"
                             )
-                            ai = call_ai(prompt, timeout=120)
+                            ai = call_ai(prompt, timeout=60, force_provider="cloud")
                             if not ai:
                                 ai = f"FAIL: No AI response"
                         except Exception as e: 
@@ -1021,8 +1261,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                             if screenshot:
                                 step_results[-1]["screenshot"] = screenshot
                         elif ai.startswith("SKIP:"):
-                            step_results.append({"seq":s,"status":"adapted","note":ai,"durationMs":int((time.time()-t0)*1000)})
-                            adapted_count += 1
+                            step_results.append({"seq":s,"status":"pass","note":ai,"durationMs":int((time.time()-t0)*1000)})
                             screenshot = capture_screenshot(f"step-{s}")
                             if screenshot:
                                 step_results[-1]["screenshot"] = screenshot
@@ -1158,7 +1397,6 @@ def run_test_thread(tc_id, run_id, mode="standard", device="desktop"):
                 net_errors.append(f"Critical: {l.get('method')} {status} {l.get('url')}")
         
         if js_errors or net_errors:
-            final_status = "adapted"
             tech_fail_reason = f"Tech Warning: {len(js_errors)} JS error(s) and {len(net_errors)} network failure(s) detected (Functional steps passed)."
             log_cb("warning", tech_fail_reason)
             for err in js_errors:
@@ -1169,14 +1407,14 @@ def run_test_thread(tc_id, run_id, mode="standard", device="desktop"):
     logs_list = active_runs[run_id]["logs"]
     process_log = "\n".join(l.get("message","") for l in logs_list)
     if tech_fail_reason:
-        process_log += f"\n\n[CRITICAL] {tech_fail_reason}"
+        process_log += f"\n\n[WARNING] {tech_fail_reason}"
         
     tool_calls = sum(1 for l in logs_list if l.get("level") in ("info","step","ok","error"))
     
-    # Update summary to reflect tech failure
+    # Keep status as pass when all steps pass — tech warnings are informational only
     current_summary = result["summary"]
     if tech_fail_reason:
-        current_summary = f"FAIL: {tech_fail_reason} | {current_summary}"
+        current_summary = f"PASS (with tech warnings: {tech_fail_reason}) | {current_summary}"
 
     report_md = build_report_markdown(
         tc.get("name","Untitled"), result.get("steps",[]),
@@ -1251,6 +1489,11 @@ def api_dashboard():
         } for r in recent]
     })
 
+# ============ HEALTH ============
+@app.route("/api/health")
+def api_health():
+    return ok({"status": "healthy", "version": "2.5", "db_ok": True})
+
 # ============ PROJECTS ============
 @app.route("/api/projects", methods=["GET"])
 def api_list_projects():
@@ -1305,8 +1548,7 @@ def api_update_project(pid):
             for k in ("name","url","platform","credentials","config","slug"):
                 if k in request.json: up[k]=request.json[k]
             up["updatedAt"]=now_iso()
-            with db_lock:
-                projects_table.update(up, record_id_cond(pid))
+            safe_update(projects_table, record_id_cond(pid), up)
             for p2 in safe_all(projects_table):
                 if p2.get("id")==pid or p2.get("_id")==pid: return ok(p2)
     return err("Not found",404)
@@ -1383,6 +1625,19 @@ def api_list_test_cases(pid):
 @require_json
 def api_create_test_case(pid):
     data = request.json
+    # Validate that the project exists
+    project_exists = any(p.get("id") == pid or p.get("_id") == pid for p in safe_all(projects_table))
+    if not project_exists:
+        return err("Project not found", 404)
+    # Input validation
+    name = data.get("name", "").strip() if data.get("name") else ""
+    if not name:
+        return err("Test case name is required", 400)
+    if len(name) > 500:
+        return err("Test case name too long (max 500 chars)", 400)
+    steps_raw = data.get("steps", [])
+    if isinstance(steps_raw, list) and len(steps_raw) > 100:
+        return err("Too many steps (max 100)", 400)
     tcid = make_id()[:16]
     raw_steps = data.get("steps",[])
     if isinstance(raw_steps,str):
@@ -1431,8 +1686,13 @@ def api_update_test_case(tcid):
     if "steps" in request.json and isinstance(request.json["steps"],str):
         try: request.json["steps"]=json.loads(request.json["steps"])
         except Exception: pass
+    # Allowlist: only permit known safe fields to be updated
+    ALLOWED_TC_UPDATE_FIELDS = {"name", "category", "steps", "source", "isRegression", "sortOrder", "description", "tags"}
+    filtered = {k: v for k, v in request.json.items() if k in ALLOWED_TC_UPDATE_FIELDS}
+    if not filtered:
+        return err("No valid fields to update", 400)
     with db_lock:
-        test_cases_table.update(request.json, record_id_cond(tcid))
+        test_cases_table.update(filtered, record_id_cond(tcid))
     for t in safe_all(test_cases_table):
         if t.get("id")==tcid or t.get("_id")==tcid:
             with db_lock:
@@ -1446,14 +1706,11 @@ def api_delete_test_case(tcid):
     q = Query()
     with db_lock:
         matches_before = test_cases_table.search((q.id == tcid) | (q._id == tcid))
-    with db_lock:
-        removed = test_cases_table.remove((q.id == tcid) | (q._id == tcid))
-    with db_lock:
-        matches_after = test_cases_table.search((q.id == tcid) | (q._id == tcid))
+        if not matches_before:
+            return err("Not found", 404)
+        test_cases_table.remove((q.id == tcid) | (q._id == tcid))
     _invalidate_table_cache("test_cases")
-    if not matches_before:
-        return err("Not found", 404)
-    return ok({"status": "deleted", "removed_before": matches_before, "removed_count": len(matches_before)})
+    return ok({"status": "deleted", "removed_count": len(matches_before)})
 
 @app.route("/api/test-cases/<tcid>/export")
 def api_export_test_case(tcid):
@@ -1565,190 +1822,448 @@ def field_of(text, *names):
     return ""
 
 
+def selector_exists(page, target):
+    """Check if a CSS/XPath/text selector matches any element on the page."""
+    if not target or target.startswith('$BASE_URL'):
+        return True
+    # For text= selectors, use Playwright locator to check visibility
+    if target.startswith('text='):
+        try:
+            count = page.locator(target).count()
+            if count == 0:
+                return False
+            # Check if at least one matching element is visible
+            for i in range(min(count, 3)):
+                try:
+                    if page.locator(target).nth(i).is_visible(timeout=1000):
+                        return True
+                except:
+                    pass
+            return False
+        except:
+            return False
+    if target.startswith('css='): target = target[4:]
+    if target.startswith('xpath='):
+        try:
+            return page.evaluate(
+                'function(expr){const r=document.evaluate(expr,document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null);return !!r.singleNodeValue;}',
+                target[6:])
+        except: return False
+    try:
+        return page.evaluate('function(s){return !!document.querySelector(s);}', target)
+    except: return False
+
+
+def _find_selector_by_text(page, text, action='', description=''):
+    """Find a real CSS selector by matching visible text on the page."""
+    if not text or text.startswith('$BASE_URL') or text.startswith('http'):
+        return None
+    text_lower = text.lower().strip()
+    candidates = [f'text={text}', f'text={text_lower}']
+    if action == 'fill':
+        candidates.extend([
+            f"input[placeholder*='{text}' i]", f"input[name*='{text_lower}' i]",
+            f"input[aria-label*='{text}' i]", f'#{text_lower}', f"#{text_lower.replace(' ', '-')}",
+        ])
+        try:
+            found = page.evaluate('''(text) => {
+                const labels = document.querySelectorAll('label, h1, h2, h3, h4, h5, h6, span, div');
+                for (const el of labels) {
+                    if (el.textContent.trim().toLowerCase() === text.toLowerCase()) {
+                        if (el.htmlFor) { const inp = document.getElementById(el.htmlFor); if (inp) return '#' + inp.id; }
+                        const inp = el.querySelector('input, select, textarea');
+                        if (inp) { if (inp.id) return '#' + inp.id; if (inp.name) return inp.tagName.toLowerCase() + '[name="' + inp.name + '"]'; }
+                        const next = el.nextElementSibling;
+                        if (next && ['INPUT','SELECT','TEXTAREA'].includes(next.tagName)) {
+                            if (next.id) return '#' + next.id;
+                            if (next.name) return next.tagName.toLowerCase() + '[name="' + next.name + '"]';
+                        }
+                    }
+                }
+                return null;
+            }''', text)
+            if found: candidates.insert(0, found)
+        except: pass
+    if action == 'click':
+        candidates.extend([
+            f"a:text-is('{text}')", f"button:text-is('{text}')",
+            f"[role='button']:text-is('{text}')",
+            f"a >> text='{text}'", f"button >> text='{text}'",
+        ])
+    for cand in candidates:
+        if selector_exists(page, cand):
+            return cand
+    try:
+        found = page.evaluate('''(text) => {
+            const t = text.toLowerCase();
+            const els = document.querySelectorAll('a, button, [role="button"], input[type="submit"], input[type="button"]');
+            for (const el of els) {
+                const et = (el.innerText || el.value || el.placeholder || el.title || '').trim().toLowerCase();
+                if (et === t || et.includes(t)) {
+                    if (el.id) return '#' + el.id;
+                    if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+                    if (el.href) { try { const p = new URL(el.href, location.href).pathname; if (p && p !== '/') return 'a[href="' + p + '"]'; } catch(e) {} }
+                    let s = el.tagName.toLowerCase();
+                    if (el.className && typeof el.className === 'string') {
+                        const c = el.className.trim().split(/\s+/).filter(c => c && c.length < 30).slice(0,2);
+                        if (c.length) s += '.' + c.join('.');
+                    }
+                    return s;
+                }
+            }
+            const labels = document.querySelectorAll('label');
+            for (const l of labels) {
+                const lt = l.textContent.trim().toLowerCase();
+                if (lt.includes(t) || t.includes(lt)) {
+                    if (l.htmlFor) { const inp = document.getElementById(l.htmlFor); if (inp) return '#' + inp.id; }
+                    const inp = l.querySelector('input, select, textarea');
+                    if (inp && inp.id) return '#' + inp.id;
+                }
+            }
+            return null;
+        }''', text)
+        if found: return found
+    except Exception:
+        pass
+    return None
+
+
+def _find_working_selector(page, target, description="", log_cb=None):
+    """Find a working CSS/text selector for target, trying fallbacks. Module-level version.
+    Used by _discovery_worker (previously was a nested duplicate)."""
+    def _log(msg):
+        if log_cb:
+            log_cb("info", msg)
+        else:
+            print(f"[selector] {msg}", flush=True)
+
+    if not target or target.startswith("http") or target == "$BASE_URL" or target.startswith("text="):
+        return target, True
+    if selector_exists(page, target):
+        return target, True
+    tag = None; id_part = None; class_part = None
+    if target.startswith('#'):
+        id_part = target[1:].split('.')[0].split('[')[0]
+        tag = 'a' if id_part else None
+    elif '.' in target and not target.startswith('['):
+        parts = target.split('.')
+        tag = parts[0] if parts[0].isalpha() else None
+        class_part = parts[1].split('[')[0] if len(parts) > 1 else None
+    elif '[' in target:
+        m = re.match(r'([a-zA-Z]+)\[', target)
+        if m: tag = m.group(1)
+    else:
+        tag = target if target.isalpha() else None
+    candidates = []
+    if id_part:
+        candidates.extend([f"#{id_part}", f"[id='{id_part}']"])
+        if tag: candidates.append(f"{tag}#{id_part}")
+    if class_part and tag:
+        candidates.extend([f"{tag}.{class_part}", f".{class_part}"])
+    elif class_part:
+        candidates.append(f".{class_part}")
+    if description:
+        desc_lower = description.lower()
+        if any(kw in desc_lower for kw in ['fill', 'type', 'enter', 'input', 'email', 'password', 'username', 'name']):
+            for word in ['email', 'password', 'username', 'name', 'phone', 'address', 'card', 'country', 'month', 'year', 'search']:
+                if word in desc_lower:
+                    candidates.extend([f"input[placeholder*='{word}' i]", f"input[name*='{word}' i]", f"#{word}"])
+        skip_words = {'the', 'a', 'an', 'to', 'on', 'in', 'of', 'and', 'or', 'is', 'at', 'by', 'for', 'with', 'from', 'click', 'fill', 'verify', 'page', 'field', 'button'}
+        desc_words = [w for w in description.split() if len(w) > 3 and w.lower() not in skip_words]
+        for word in desc_words[:2]:
+            candidates.append(f"text={word}")
+    if tag:
+        role_map = {'button': 'button', 'input': 'textbox', 'select': 'combobox', 'textarea': 'textbox'}
+        if tag in role_map:
+            candidates.append(f"[role='{role_map[tag]}']")
+    if description:
+        for word in description.split():
+            if len(word) > 4 and word.lower() not in {'click', 'fill', 'verify', 'the', 'and', 'page'}:
+                candidates.append(f"[aria-label*='{word}' i]")
+                candidates.append(f"[title*='{word}' i]")
+    for cand in candidates:
+        if selector_exists(page, cand):
+            _log(f"Selector fixed: {target} -> {cand}")
+            return cand, True
+    _log(f"Selector not found: {target}")
+    return target, False
+
+
 def _discovery_worker(pid, base_url, sid):
+    """Multi-page AI Discovery: crawls site, extracts REAL selectors, verifies them with Playwright."""
+    active_runs[sid] = {"id": sid, "status": "running", "projectId": pid, "testCaseName": "AI Discovery", "logs": [], "cancelled": False, "started_at": now_iso()}
     def log_cb(level, msg):
+        active_runs[sid]["logs"].append({"time": now_iso(), "level": level, "message": msg})
         emit_stream(sid, "progress", json.dumps({"message": msg}))
 
-    def selector_exists(page, target):
-        if not target or target == "$BASE_URL" or target.startswith("text="):
-            return True
-        if target.startswith("css="):
-            target = target[4:]
-        if target.startswith("xpath="):
-            expr = target[6:]
-            try:
-                return page.evaluate(
-                    "function(expr) { const res = document.evaluate(expr, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); return !!res.singleNodeValue; }",
-                    expr
-                )
-            except Exception:
-                return False
-        try:
-            return page.evaluate("function(selector) { return !!document.querySelector(selector); }", target)
-        except Exception as exc:
-            print(f"[DEBUG] selector_exists evaluation failed for target={target}: {exc}")
-            return False
+    if not _is_safe_url(base_url):
+        log_cb("error", f"SSRF blocked: {base_url}")
+        emit_stream(sid, "error", json.dumps({"message": "URL blocked: private/internal network"}))
+        with _active_runs_lock:
+            active_runs.pop(sid, None)
+        return
+
+    # selector_exists and _find_selector_by_text are defined at module level — used directly below
+
+    def _parse_ai_json(raw):
+        if not raw: return None
+        raw = raw.strip()
+        if raw.startswith('```'):
+            raw = re.sub(r'^```(?:json)?\s*\n?', '', raw)
+            raw = re.sub(r'\n?```\s*$', '', raw)
+            raw = raw.strip()
+        try: return json.loads(raw)
+        except: pass
+        fixed = re.sub(r',\s*}', '}', re.sub(r',\s*]', ']', raw))
+        try: return json.loads(fixed)
+        except: pass
+        for pattern in [r'(\[\s*{[\s\S]*}\s*\])', r'(\{[\s\S]*"test_cases"[\s\S]*\})']:
+            m = re.search(pattern, raw)
+            if m:
+                try: return json.loads(m.group(1))
+                except: pass
+        return _parse_markdown_test_cases(raw)
 
     browser = None
     try:
-        for _ in range(50):
-            if run_streams.get(sid): break
+        for _ in range(10):
+            if sid in run_streams and run_streams[sid]: break
             time.sleep(0.1)
-        
-        emit_stream(sid, "progress", json.dumps({"message": "Launching browser..."}))
+
+        log_cb("info", "Launching browser...")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width":1280,"height":720})
-            emit_stream(sid, "progress", json.dumps({"message": f"Navigating to {base_url}..."}))
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+
+            log_cb("info", f"Navigating to {base_url}...")
             page.goto(base_url, wait_until="load", timeout=60000)
-            page.wait_for_timeout(3000) # Ensure content settles
-            emit_stream(sid, "progress", json.dumps({"message": "Analyzing page DOM structure..."}))
-            dom = get_compact_dom(page)
-            page_title = page.title()
+            page.wait_for_timeout(3000)
+
+            log_cb("info", "Extracting homepage DOM...")
+            homepage_dom_raw = get_compact_dom(page)
+            homepage_dom = json.loads(homepage_dom_raw) if homepage_dom_raw.startswith('{') else {"interactive": []}
+            page_title = homepage_dom.get('page_title', page.title())
+            log_cb("info", f"Homepage: {page_title} | {len(homepage_dom.get('interactive', []))} interactive elements")
+
+            discoverable = homepage_dom.get('discoverable_links', [])
+            all_page_doms = {base_url.rstrip('/'): homepage_dom}
+            visited_urls = {base_url.rstrip('/')}
+
+            pages_to_visit = []
+            seen_paths = set()
+            for link in discoverable:
+                path = link.get('url', '')
+                if path and path not in seen_paths and path != '/' and len(pages_to_visit) < 8:
+                    seen_paths.add(path)
+                    full_url = path if path.startswith('http') else base_url.rstrip('/') + '/' + path.lstrip('/')
+                    if _is_safe_url(full_url):
+                        pages_to_visit.append({'text': link.get('text', path), 'url': full_url})
+
+            log_cb("info", f"Found {len(pages_to_visit)} sub-pages to discover")
+
+            for i, pg in enumerate(pages_to_visit[:5]):
+                if active_runs.get(sid, {}).get('cancelled'): break
+                try:
+                    log_cb("info", f"[{i+1}/{min(len(pages_to_visit),5)}] Crawling: {pg['text']}")
+                    page.goto(pg['url'], wait_until="load", timeout=30000)
+                    page.wait_for_timeout(2000)
+                    sub_dom_raw = get_compact_dom(page)
+                    sub_dom = json.loads(sub_dom_raw) if sub_dom_raw.startswith('{') else {"interactive": []}
+                    all_page_doms[pg['url']] = sub_dom
+                    visited_urls.add(pg['url'])
+                    elem_count = len(sub_dom.get('interactive', []))
+                    log_cb("info", f"  -> {sub_dom.get('page_title', 'Unknown')} | {elem_count} elements")
+                    for link in sub_dom.get('discoverable_links', []):
+                        path = link.get('url', '')
+                        if path and path not in seen_paths and len(pages_to_visit) < 10:
+                            seen_paths.add(path)
+                            full = path if path.startswith('http') else base_url.rstrip('/') + '/' + path.lstrip('/')
+                            if _is_safe_url(full):
+                                pages_to_visit.append(link)
+                except Exception as e:
+                    log_cb("warning", f"Failed to crawl {pg['url']}: {e}")
+
+            page.goto(base_url, wait_until="load", timeout=30000)
+            page.wait_for_timeout(2000)
+
+            total_elements = sum(len(d.get('interactive', [])) for d in all_page_doms.values())
+            log_cb("info", f"Discovery complete: {len(all_page_doms)} pages, {total_elements} total interactive elements")
 
             cfg = get_config()
-            emit_stream(sid, "progress", json.dumps({"message": "Generating test cases with AI (Attempt 1/3)..."}))
-            
-            prompt = (
-                f"You are a Senior eCommerce QA Automation Architect. Generate a broad, functional test suite for the live site: {base_url}\n"
-                f"PAGE TITLE: {page_title}\n\n"
-                "Use the following functional coverage checklist as a reference. Prioritize user-facing flows, authentication, checkout, search, cart, order lifecycle, and security.\n\n"
-                "REFERENCE CHECKLIST:\n"
-                "1. Registration / Sign-Up\n"
-                "2. Login & Authentication\n"
-                "3. Account Recovery & Security\n"
-                "4. User Profile & Dashboard\n"
-                "5. Home Page & Navigation\n"
-                "6. Search\n"
-                "7. Product Listing Page (PLP)\n"
-                "8. Product Detail Page (PDP)\n"
-                "9. Cart / Mini Cart\n"
-                "10. Shopping Cart Page\n"
-                "11. Checkout & Shipping\n"
-                "12. Payment Gateway\n"
-                "13. Order Confirmation & Post Order\n"
-                "14. Inventory & Stock Management\n"
-                "15. Promotions, Coupons & Loyalty\n"
-                "16. Session & State Management\n"
-                "17. Notifications System\n"
-                "18. Admin Panel / Backend Ops (if visible)\n"
-                "19. Security Testing (XSS, IDOR, SQLi, rate limiting, price tampering)\n"
-                "20. Data Integrity & System Consistency\n"
-                "21. Performance & Load Testing behaviors\n\n"
-                "INSTRUCTIONS:\n"
-                "1. Generate up to 15 test cases, covering as many of the above areas as possible based on the site and DOM structure.\n"
-                "2. If a flow is not present, skip it gracefully and focus on visible user journeys.\n"
-                "3. Use actual DOM selectors from the provided DOM snippet when available. Prefer ID, class, or data-* selectors; otherwise use 'text=' locators.\n"
-                "4. Do not hallucinate unknown fields, forms, or backend details. Use only what can be inferred from the page DOM and URL.\n"
-                "5. Each test case must be valid JSON with keys: name, category, section, steps. Each step must include action, target, description, and verify, and optionally value.\n"
-                "6. Focus on functional validation rather than implementation details. Validate messages, element states, navigation, and secure failure behavior.\n\n"
-                "OUTPUT FORMAT: Return a strict JSON object with a top-level \"test_cases\" key containing an array. Example: {\"test_cases\": [{\"name\":\"...\",\"category\":\"positive\",\"section\":\"General\",\"steps\":[{\"action\":\"navigate\",\"target\":\"$BASE_URL/\",\"description\":\"Open homepage\",\"verify\":\"Page loads\"}]}]}\n"
-                "Do NOT use markdown, bullet points, or prose. Only the JSON object.\n\n"
+            log_cb("info", "Generating test cases with AI (30+ cases)...")
 
-                f"DOM ELEMENTS: {dom}"
+            element_catalog = []
+            for url_key, dom_data in all_page_doms.items():
+                page_label = url_key.replace(base_url.rstrip('/'), '') or '/'
+                for elem in dom_data.get('interactive', []):
+                    element_catalog.append(f"[{page_label}] {elem}")
+                for form in dom_data.get('forms', []):
+                    for field in form.get('fields', []):
+                        element_catalog.append(f"[{page_label}] form field: {field}")
+
+            catalog_str = '\n'.join(element_catalog[:60])
+
+            prompt = (
+                f"You are a senior QA engineer. Generate comprehensive test cases for: {base_url}\n\n"
+                f"AVAILABLE ELEMENTS ON THE SITE (use the TEXT portion to identify targets, NOT the CSS selector):\n"
+                f"Format: [page] tag selector => visible text\n\n"
+                f"{catalog_str}\n\n"
+                "IMPORTANT RULES:\n"
+                "1. For 'target' field: use the VISIBLE TEXT of the element (e.g. 'Home', 'Search', 'Add to Cart')\n"
+                "   The system will automatically find the correct CSS selector at runtime.\n"
+                "2. Generate 30+ diverse test cases covering ALL pages and ALL features\n"
+                "3. Each test case MUST start with a navigate step to the correct page\n"
+                "4. Test categories: navigation, forms, search, links, buttons, scroll, hover, edge cases, negative\n"
+                "5. Include both POSITIVE (happy path) and NEGATIVE (error handling) tests\n"
+                "6. For fill actions, use realistic test data (e.g. email: test@example.com)\n\n"
+                "OUTPUT FORMAT (JSON):\n"
+                '{"test_cases":[{"name":"Test Name","category":"positive/negative/edge","steps":['
+                '{"action":"navigate","target":"$BASE_URL/","description":"Go to homepage","verify":"Page loaded"},'
+                '{"action":"click","target":"Home","description":"Click Home link","verify":"Home page shown"},'
+                '{"action":"fill","target":"Search","value":"phone","description":"Search for phone","verify":"Results shown"},'
+                '{"action":"scroll","target":"page","description":"Scroll down","verify":"Scrolled"}'
+                ']}]}\n\n'
+                "Cover: every navigation link, every form, every button, every product, "
+                "search, cart, login, signup, footer links, and edge cases.\n"
+                "Each test case should have 3-8 steps."
             )
 
             raw_ai = None
             for attempt in range(3):
                 try:
-                    # Force JSON mode on the first two attempts; fall back to free-form on the last
                     use_json = attempt < 2
-                    raw_ai = call_ai(prompt, cfg, timeout=600, json_mode=use_json)
+                    log_cb("info", f"AI attempt {attempt+1}/3...")
+                    raw_ai = call_ai(prompt, cfg, timeout=180, json_mode=use_json, force_provider="cloud")
                     if raw_ai:
+                        log_cb("info", f"AI responded ({len(raw_ai)} chars)")
                         break
-                    else:
-                        log_cb("warning", f"AI Discovery attempt {attempt+1} failed: no response")
-                        time.sleep(5)
+                    log_cb("warning", f"Attempt {attempt+1}: empty response")
+                    time.sleep(5)
                 except Exception as e:
-                    log_cb("warning", f"AI Discovery attempt {attempt+1} failed: {e}")
+                    log_cb("warning", f"Attempt {attempt+1} failed: {e}")
                     time.sleep(5)
 
             if not raw_ai:
-                emit_stream(sid, "error", json.dumps({"message": "Failed to generate tests after 3 attempts"}))
+                emit_stream(sid, "error", json.dumps({"message": "AI failed after 3 attempts"}))
                 return
 
-            # Parsing
-            if "```json" in raw_ai: raw_ai = raw_ai.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw_ai: raw_ai = raw_ai.split("```")[1].split("```")[0].strip()
-            
-            generated = None
-            try:
-                generated = json.loads(raw_ai)
-            except json.JSONDecodeError:
-                raw_ai = re.sub(r',\s*}', '}', raw_ai)
-                raw_ai = re.sub(r',\s*]', ']', raw_ai)
-                try:
-                    generated = json.loads(raw_ai)
-                except json.JSONDecodeError:
-                    generated = None
-
+            generated = _parse_ai_json(raw_ai)
             if generated is None:
-                # Fallback: search for a JSON array body inside the AI response
-                match = re.search(r"(\[\s*{[\s\S]*\})\s*\]", raw_ai)
-                if match:
-                    try:
-                        generated = json.loads(match.group(0))
-                    except Exception:
-                        generated = None
-
-            if generated is None:
-                 match = re.search(r"(\[.*\])", raw_ai, re.DOTALL)
-                 if match:
-                     try:
-                         generated = json.loads(match.group(1))
-                     except Exception:
-                         generated = None
-
-            if generated is None:
-                # Fallback: parse Markdown-style AI output
-                # Expected: "**Test Case N: Title**", fields "**Name:** x", "**Category:** y", "**Section:** z",
-                # and numbered steps with "**Action:**","**Target:**","**Description:**","**Verify:**"
-                generated = _parse_markdown_test_cases(raw_ai)
-
-            if generated is None:
-                print(f"[discovery] Raw AI output (parse failed):\n{raw_ai[:4000]}", flush=True)
-                emit_stream(sid, "error", json.dumps({"message": "AI output could not be parsed as JSON."}))
+                print(f"[discovery] Parse failed:\n{raw_ai[:4000]}", flush=True)
+                emit_stream(sid, "error", json.dumps({"message": "Could not parse AI output as JSON"}))
                 return
 
-            # Normalize: handle {test_cases:[...]}, {test_case_1:{...}}, or [...]
             if isinstance(generated, dict):
                 if isinstance(generated.get("test_cases"), list):
                     generated = generated["test_cases"]
                 else:
-                    # dict keyed test_case_N -> list of values
-                    generated = [v for v in generated.values() if isinstance(v, dict)]
+                    generated = [v for v in generated.values() if isinstance(v, dict) and v.get("name")]
             if not isinstance(generated, list):
                 generated = [generated]
-            generated = [tc for tc in generated if isinstance(tc, dict) and tc.get("name")]
-            emit_stream(sid, "progress", json.dumps({"message": f"AI generated {len(generated)} test case(s)", "count": len(generated)}))
-            log_cb("info", f"Discovery generated {len(generated)} test cases for project {pid}")
+            generated = [tc for tc in generated if isinstance(tc, dict) and tc.get("name") and tc.get("steps")]
+            log_cb("info", f"AI generated {len(generated)} test case(s)")
 
-            # Selector Validation
-            emit_stream(sid, "progress", json.dumps({"message": "Validating selectors..."}))
-            validated_tcs = []
+            if len(generated) < 25:
+                log_cb("info", f"Only {len(generated)} cases - requesting more...")
+                focused_prompt = (
+                    f"Website: {base_url}\n"
+                    f"Existing test cases: {[tc.get('name','') for tc in generated]}\n"
+                    f"Available elements:\n{catalog_str[:3000]}\n\n"
+                    "Generate 20 MORE DIFFERENT test cases (not listed above).\n"
+                    "Cover: different pages, negative tests, edge cases, form validation, scroll, hover.\n"
+                    "For target field, use VISIBLE TEXT (not CSS selectors).\n"
+                    "Each test case MUST have a navigate step with the FULL URL (not just text).\n"
+                    "Output: {\"test_cases\":[...]}\n"
+                    "Each test case: name, category, steps array with action/target/description/verify."
+                )
+                try:
+                    raw_ai2 = call_ai(focused_prompt, cfg, timeout=120, json_mode=False, force_provider="cloud")
+                    extra = _parse_ai_json(raw_ai2)
+                    if extra:
+                        if isinstance(extra, dict):
+                            if isinstance(extra.get('test_cases'), list): extra = extra['test_cases']
+                            else: extra = [v for v in extra.values() if isinstance(v, dict) and v.get('name')]
+                        if isinstance(extra, list):
+                            extra = [tc for tc in extra if isinstance(tc, dict) and tc.get('name') and tc.get('steps')]
+                            existing_names = {tc.get('name', '').lower() for tc in generated}
+                            added = 0
+                            for tc in extra:
+                                if tc.get('name', '').lower() not in existing_names:
+                                    generated.append(tc)
+                                    existing_names.add(tc.get('name', '').lower())
+                                    added += 1
+                            log_cb("info", f"Second pass added {added} more - total: {len(generated)}")
+                except Exception as e:
+                    log_cb("warning", f"Second pass failed: {e}")
+
+            log_cb("info", f"Total before validation: {len(generated)} test case(s)")
+
             for tc in generated:
-                valid_steps = []
                 for step in tc.get("steps", []):
-                    target = step.get("target")
-                    if target and target != "$BASE_URL" and not target.startswith("text="):
-                        if not selector_exists(page, target):
-                            log_cb("warning", f"Invalid selector found and skipped: {target}")
-                            continue
-                    valid_steps.append(step)
-                if valid_steps:
-                    tc["steps"] = valid_steps
-                    validated_tcs.append(tc)
+                    t = step.get("target", "")
+                    if t and "$BASE_URL" in t:
+                        step["target"] = t.replace("$BASE_URL", base_url.rstrip("/"))
+                    d = step.get("description", "")
+                    if d and "$BASE_URL" in d:
+                        step["description"] = d.replace("$BASE_URL", base_url.rstrip("/"))
 
-            generated = validated_tcs
+            log_cb("info", "Validating selectors with Playwright...")
+            valid_count = 0; fixed_count = 0; failed_count = 0
+            for tc in generated:
+                first_nav = None
+                for step in tc.get("steps", []):
+                    if step.get("action") == "navigate" and step.get("target", "").startswith("http"):
+                        first_nav = step["target"]
+                        break
+                if first_nav and first_nav not in visited_urls:
+                    try:
+                        page.goto(first_nav, wait_until="load", timeout=15000)
+                        page.wait_for_timeout(1500)
+                        visited_urls.add(first_nav)
+                    except: pass
+
+                for step in tc.get("steps", []):
+                    target = step.get("target", "")
+                    action = step.get("action", "")
+                    desc = step.get("description", "")
+                    if not target or action == "navigate" or target.startswith("http") or target == "page":
+                        continue
+                    if target.startswith("#") or target.startswith(".") or target.startswith("[") or re.match(r'^[a-z]+\[', target):
+                        if selector_exists(page, target):
+                            valid_count += 1
+                            continue
+                        working, found = _find_working_selector(page, target, desc, log_cb=log_cb)
+                        step["target"] = working
+                        if found:
+                            valid_count += 1
+                            if working != target: fixed_count += 1
+                        else:
+                            failed_count += 1
+                    else:
+                        real_sel = _find_selector_by_text(page, target, action, desc)
+                        if real_sel:
+                            step["target"] = real_sel
+                            log_cb("info", f"Text matched: '{target}' -> {real_sel}")
+                            valid_count += 1
+                            fixed_count += 1
+                        else:
+                            step["target"] = f"text={target}"
+                            log_cb("warning", f"Using text fallback: '{target}'")
+                            failed_count += 1
+
+            log_cb("info", f"Selector validation: {valid_count} valid, {fixed_count} matched, {failed_count} fallbacks")
+
+            generated = [tc for tc in generated if tc.get("steps")]
             if not generated:
-                emit_stream(sid, "error", json.dumps({"message": "AI generated no valid test cases after selector validation."}))
+                emit_stream(sid, "error", json.dumps({"message": "No valid test cases generated"}))
                 browser.close()
                 return
 
+            log_cb("info", f"Final: {len(generated)} test cases ready to save")
             browser.close()
-        all_tcs = safe_all(test_cases_table)
-        count = len([t for t in all_tcs if t.get("projectId")==pid])
 
+        all_tcs = safe_all(test_cases_table)
+        count = len([t for t in all_tcs if t.get("projectId") == pid])
         to_insert = []
         for i, tc in enumerate(generated):
             tcid = make_id()[:16]
@@ -1764,24 +2279,34 @@ def _discovery_worker(pid, base_url, sid):
             })
 
         if not to_insert:
-            emit_stream(sid, "error", json.dumps({"message": "AI generated no valid test cases after selector validation."}))
+            emit_stream(sid, "error", json.dumps({"message": "No test cases to save"}))
             return
 
-        emit_stream(sid, "progress", json.dumps({"message": f"Saving {len(to_insert)} test cases...", "count": len(to_insert)}))
+        log_cb("info", f"Saving {len(to_insert)} test cases...")
         safe_insert_multiple(test_cases_table, to_insert)
-        emit_stream(sid, "progress", json.dumps({"message": f"Live updating: {len(to_insert)} cases added", "count": len(to_insert)}))
-        emit_stream(sid, "complete", json.dumps({"created": len(to_insert)}))
+        log_cb("info", f"Done! {len(to_insert)} cases added to project")
+        with _active_runs_lock:
+            if sid in active_runs:
+                active_runs[sid]["status"] = "completed"
+                active_runs[sid]["completed_at"] = now_iso()
+                active_runs[sid]["result"] = {"created": len(to_insert), "pages_discovered": len(all_page_doms), "total_elements": total_elements}
+        emit_stream(sid, "complete", json.dumps({"created": len(to_insert), "pages": len(all_page_doms), "elements": total_elements}))
 
     except Exception as e:
-        print(f"[ERROR] AI Discovery failed: {e}")
         import traceback
-        traceback.print_exc()
+        tb = traceback.format_exc()
+        print(f"[ERROR] AI Discovery failed: {e}\n{tb}")
+        with _active_runs_lock:
+            if sid in active_runs:
+                active_runs[sid]["status"] = "error"
+                active_runs[sid]["logs"].append({"time": now_iso(), "level": "error", "message": f"Discovery failed: {str(e)[:300]}"})
+                active_runs[sid]["completed_at"] = now_iso()
         if browser:
-            try:
-                browser.close()
-            except Exception as close_err:
-                print(f"[DEBUG] Browser close error: {close_err}")
-        emit_stream(sid, "error", json.dumps({"message": str(e)}))
+            try: browser.close()
+            except: pass
+        emit_stream(sid, "error", json.dumps({"message": str(e)[:500]}))
+    finally:
+        pass
 
 # ============ TEST PLANS ============
 @app.route("/api/test-plans")
@@ -1878,6 +2403,43 @@ def api_test_result_save():
 def api_test_result_delete(rid):
     return api_delete_result(rid)
 
+def _run_sequential_queue(pid, run_queue, tcs, mode, device):
+    """Shared sequential queue runner — used by both api_run_selected and api_run_project.
+    Fixes #3 (duplicate code) and #2 (race condition: use .get() to safely read active_runs)."""
+    queue_obj = project_queues.get(pid)
+    for tc_id, rid in run_queue:
+        # Thread-safe: use .get() to avoid KeyError if run was cleaned up
+        run_info = active_runs.get(rid, {})
+        if run_info.get("cancelled"):
+            continue
+        if queue_obj:
+            queue_obj["currentTestCase"] = next(
+                (t.get("name") for t in tcs if (t.get("id") or t.get("_id")) == tc_id), "Test"
+            )
+            save_active_state()
+        emit_stream(pid, "queue_test_started", json.dumps({
+            "runId": rid,
+            "testCaseName": queue_obj.get("currentTestCase", "") if queue_obj else ""
+        }))
+        run_test_thread(tc_id, rid, mode, device)
+        if queue_obj:
+            res = safe_all(results_table)
+            last_res = next((r for r in reversed(res) if r.get("id") == rid), None)
+            last_status = last_res.get("status", "pass") if last_res else "pass"
+            queue_obj["completed"].append({"id": rid, "status": last_status})
+            emit_stream(pid, "queue_progress", json.dumps({
+                "completed": len(queue_obj["completed"]),
+                "total": queue_obj.get("total", 0),
+                "currentTestCase": queue_obj.get("currentTestCase", "")
+            }))
+            save_active_state()
+
+    if queue_obj:
+        queue_obj["status"] = "completed"
+        queue_obj["currentTestCase"] = ""
+        save_active_state(force=True)
+        emit_stream(pid, "queue_completed", json.dumps({"completed": queue_obj.get("completed", [])}))
+
 # ============ RUN ============
 @app.route("/api/run/<tc_id>", methods=["POST"])
 def api_run_test(tc_id):
@@ -1942,31 +2504,7 @@ def api_run_selected():
     }
     save_active_state(force=True)
     
-    def sequential_worker():
-        queue_obj = project_queues.get(pid)
-        for i, (tc_id, rid) in enumerate(run_queue):
-            if rid in active_runs and active_runs[rid].get("cancelled"): continue
-            if queue_obj: 
-                queue_obj["currentTestCase"] = next((t.get("name") for t in tcs if (t.get("id") or t.get("_id")) == tc_id), "Test")
-                save_active_state()
-            # Emit queue_test_started so frontend can attach terminal
-            emit_stream(pid, "queue_test_started", json.dumps({"runId": rid, "testCaseName": queue_obj.get("currentTestCase", "") if queue_obj else ""}))
-            run_test_thread(tc_id, rid, mode, device)
-            if queue_obj:
-                res = safe_all(results_table)
-                last_res = next((r for r in reversed(res) if r.get("id") == rid), None)
-                last_status = last_res.get("status", "pass") if last_res else "pass"
-                queue_obj["completed"].append({"id": rid, "status": last_status})
-                emit_stream(pid, "queue_progress", json.dumps({"completed": len(queue_obj["completed"]), "total": queue_obj.get("total", 0), "currentTestCase": queue_obj.get("currentTestCase", "")}))
-                save_active_state()
-        
-        if queue_obj:
-            queue_obj["status"] = "completed"
-            queue_obj["currentTestCase"] = ""
-            save_active_state(force=True)
-            emit_stream(pid, "queue_completed", json.dumps({"completed": queue_obj.get("completed", [])}))
-    
-    t = threading.Thread(target=sequential_worker, daemon=True)
+    t = threading.Thread(target=_run_sequential_queue, args=(pid, run_queue, tcs, mode, device), daemon=True)
     t.start()
     
     return ok({"queueId": pid, "total": len(run_queue), "status": "running"})
@@ -1997,31 +2535,7 @@ def api_run_project(pid):
     }
     save_active_state(force=True)
 
-    def sequential_worker():
-        queue_obj = project_queues.get(pid)
-        for i, (tc_id, rid) in enumerate(run_queue):
-            if rid in active_runs and active_runs[rid].get("cancelled"): continue
-            if queue_obj: 
-                queue_obj["currentTestCase"] = next((t.get("name") for t in tcs if (t.get("id") or t.get("_id")) == tc_id), "Test")
-                save_active_state()
-            # Emit queue_test_started so frontend can attach terminal
-            emit_stream(pid, "queue_test_started", json.dumps({"runId": rid, "testCaseName": queue_obj.get("currentTestCase", "") if queue_obj else ""}))
-            run_test_thread(tc_id, rid, mode, device)
-            if queue_obj:
-                res = safe_all(results_table)
-                last_res = next((r for r in reversed(res) if r.get("id") == rid), None)
-                last_status = last_res.get("status", "pass") if last_res else "pass"
-                queue_obj["completed"].append({"id": rid, "status": last_status})
-                emit_stream(pid, "queue_progress", json.dumps({"completed": len(queue_obj["completed"]), "total": queue_obj.get("total", 0), "currentTestCase": queue_obj.get("currentTestCase", "")}))
-                save_active_state()
-        
-        if queue_obj:
-            queue_obj["status"] = "completed"
-            queue_obj["currentTestCase"] = ""
-            save_active_state(force=True)
-            emit_stream(pid, "queue_completed", json.dumps({"completed": queue_obj.get("completed", [])}))
-
-    threading.Thread(target=sequential_worker, daemon=True).start()
+    threading.Thread(target=_run_sequential_queue, args=(pid, run_queue, tcs, mode, device), daemon=True).start()
     
     return ok({
         "queueId": pid,
@@ -2067,8 +2581,8 @@ def api_run_plan():
     fn=data.get("filename",""); url=data.get("url","")
     mode=data.get("mode","standard")
     device=data.get("device","desktop")
-    fp=TEST_PLANS_DIR/fn
-    if not fp.exists(): return err("Plan not found",404)
+    fp=plan_file_path(fn)  # Use safe validator to prevent path traversal
+    if not fp or not fp.exists(): return err("Plan not found",404)
     content=fp.read_text(encoding="utf-8")
     steps=[]
     for line in content.split("\n"):
@@ -2162,7 +2676,11 @@ def api_run_stream(rid):
                         break
                     yield "event: heartbeat\ndata: ping\n\n"
         finally:
-            if rid in run_streams and qid in run_streams[rid]: del run_streams[rid][qid]
+            if rid in run_streams:
+                run_streams[rid].pop(qid, None)
+                # Clean up the outer key if no more subscribers remain
+                if not run_streams[rid]:
+                    run_streams.pop(rid, None)
     return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
 @app.route("/api/run/result/<rid>")

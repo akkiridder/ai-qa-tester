@@ -9,6 +9,7 @@ server.err
 *.bak
 *.bak2
 data/screenshots/
+data/results/
 data/active_state.json
 ref_api.js
 ref_app.js
@@ -25,3 +26,6 @@ api_test_output.txt
 *.crx
 
 config.json
+data/server_state_backup.json
+projects_export.json
+.pytest_cache/
