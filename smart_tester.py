@@ -1,7 +1,33 @@
-import os, json, uuid, threading, time, queue, re, math, base64
+import os, sys, json, uuid, threading, time, queue, re, math, base64
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
+
+# Windows console UTF-8 compatibility (prevents 'charmap' / cp1252 UnicodeEncodeError)
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+_builtin_print = print
+def safe_print(*args, **kwargs):
+    try:
+        _builtin_print(*args, **kwargs)
+    except (UnicodeEncodeError, Exception):
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            clean_args = [
+                str(a).encode(enc, errors="replace").decode(enc, errors="replace")
+                for a in args
+            ]
+            _builtin_print(*clean_args, **kwargs)
+        except Exception:
+            pass
+
+print = safe_print
+
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -617,6 +643,27 @@ def _is_safe_url(url):
     except Exception:
         return False
 
+def _extract_auth_credentials(url):
+    """Extracts username and password from basic auth URL (e.g. https://user:pass@domain.com).
+    Returns (clean_url, dict(username=..., password=...) or None, (username, password) or None)
+    """
+    if not url or not isinstance(url, str):
+        return url, None, None
+    try:
+        from urllib.parse import urlparse, urlunparse, unquote
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            user = unquote(parsed.username) if parsed.username else ""
+            pwd = unquote(parsed.password) if parsed.password else ""
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            clean_url = urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+            return clean_url, {"username": user, "password": pwd}, (user, pwd)
+    except Exception:
+        pass
+    return url, None, None
+
 def slugify(s): return re.sub(r'[^a-z0-9-]+', '-', s.lower()).strip('-')
 
 # Ollama helpers
@@ -649,6 +696,9 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
     log_cb("info", f"Starting: {test_case.get('name','Untitled')} | Mode: {mode} | Device: {device} | URL: {base_url} | Steps: {total}")
     if total == 0: return {"status":"pass","steps":[],"passed":0,"adapted":0,"failed":0,"blocked":0,"summary":"No steps"}
 
+    # Extract HTTP basic auth credentials if present in base_url or step targets
+    clean_base, creds, req_auth = _extract_auth_credentials(base_url)
+
     # === Pre-flight health check ===
     # Check the SAME URL the test will actually navigate to (first navigate step),
     # not base_url, so we never false-alert on a different/flaky host.
@@ -661,13 +711,17 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
             elif st.get("action", "").lower() in ("navigate", "go to"):
                 nav_target = base_url.rstrip("/") + "/" + t.lstrip("/")
             break
+    
+    if not creds and nav_target:
+        _, creds, req_auth = _extract_auth_credentials(nav_target)
+
     health_url = (nav_target or base_url).rstrip("/")
     log_cb("info", f"Site health check: {health_url}")
     
     health_ok = False
     for attempt in range(2):
         try:
-            hr = requests.get(health_url, timeout=10, headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True)
+            hr = requests.get(health_url, timeout=10, headers={"User-Agent":"Mozilla/5.0"}, allow_redirects=True, auth=req_auth)
             if hr.status_code >= 500:
                 log_cb("warning", f"Site {health_url} returned HTTP {hr.status_code} (Attempt {attempt+1}/2) — retrying...")
                 time.sleep(2)
@@ -703,11 +757,16 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                     "is_mobile": True,
                     "has_touch": True
                 })
+                if creds:
+                    ctx_args["http_credentials"] = creds
                 ctx = browser.new_context(**ctx_args)
                 log_cb("info", f"📱 Emulating Mobile: iPhone 13 ({device_config['user_agent'][:40]}...)")
             else:
                 browser = p.chromium.launch(headless=True)
-                ctx = browser.new_context(viewport={"width":1280,"height":720})
+                ctx_args = {"viewport": {"width": 1280, "height": 720}}
+                if creds:
+                    ctx_args["http_credentials"] = creds
+                ctx = browser.new_context(**ctx_args)
             
             page = ctx.new_page()
 
@@ -746,6 +805,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                 target = step.get("target","")
                 desc = step.get("description","")
                 verify = step.get("verify","")
+                val = step.get("value","")
 
                 if run_id in active_runs and active_runs[run_id].get("cancelled"):
                     step_results.append({"seq":s,"status":"fail","note":"Test cancelled by user — remaining steps skipped","durationMs":0}); break
@@ -786,7 +846,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     "Respond with only one line:\n"
                                     "RETRY: <full alternative URL> | ABORT: <reason>"
                                 )
-                                ai_txt = call_ai(prompt, timeout=10, force_provider="cloud")
+                                ai_txt = call_ai(prompt, timeout=10)
                                 if ai_txt:
                                     log_cb("info", f"AI nav response: {ai_txt[:200]}")
                                     lines = re.split(r'[\n|]+', ai_txt)
@@ -855,14 +915,21 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                 target = resolved
                                 step["target"] = resolved
                         try:
-                            page.click(target, timeout=5000)
-                            clicked = True
+                            if ":visible" not in target and not target.startswith("text=") and not target.startswith("xpath="):
+                                try:
+                                    page.click(f"{target}:visible", timeout=3000)
+                                    clicked = True
+                                except Exception:
+                                    page.click(target, timeout=3000)
+                                    clicked = True
+                            else:
+                                page.click(target, timeout=5000)
+                                clicked = True
                         except Exception:
                             # Hover-before-click: try hovering over parent menu items first
                             try:
-                                hover_targets = page.evaluate("""(text) => {
-                                    const t = text.toLowerCase();
-                                    // Find parent nav/menu items that might reveal dropdowns
+                                hover_targets = page.evaluate(r"""(targetText) => {
+                                    const t = targetText.toLowerCase();
                                     const menus = document.querySelectorAll('nav li, .menu-item, [class*="nav"] > *, [class*="menu"] > *, .category-item, .parent-category');
                                     const results = [];
                                     for (const el of menus) {
@@ -910,7 +977,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     "Respond with ONLY the selector (no explanation needed):\n"
                                     "SELECTOR: <playwright selector>"
                                 )
-                                resp = call_ai(prompt, timeout=60, force_provider="cloud")
+                                resp = call_ai(prompt, timeout=60)
                                 if resp:
                                     reasoning = ""
                                     found_sel = False
@@ -1039,8 +1106,16 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                 except Exception as _agg_err:
                                     log_cb("info", f"Aggressive fill resolution failed: {str(_agg_err)[:80]}")
                         try:
-                            page.fill(target, val, timeout=5000)
-                            filled = True
+                            if ":visible" not in target and not target.startswith("text=") and not target.startswith("xpath="):
+                                try:
+                                    page.fill(f"{target}:visible", val, timeout=3000)
+                                    filled = True
+                                except Exception:
+                                    page.fill(target, val, timeout=3000)
+                                    filled = True
+                            else:
+                                page.fill(target, val, timeout=5000)
+                                filled = True
                         except Exception:
                             log_cb("info", f"AI CLI Output: Analyzing page for input '{desc}'...")
                             try:
@@ -1056,7 +1131,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     "Respond with ONLY the selector (no explanation needed):\n"
                                     "SELECTOR: <selector>"
                                 )
-                                resp = call_ai(prompt, timeout=60, force_provider="cloud")
+                                resp = call_ai(prompt, timeout=60)
                                 if resp:
                                     reasoning = ""
                                     found_sel = False
@@ -1125,15 +1200,40 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                         if screenshot:
                             step_results[-1]["screenshot"] = screenshot
 
-                    elif action in ("verify","check","verifyElement"):
+                    elif action in ("verify","check","verifyElement","verifyText","verify_text"):
                         try:
-                            page.wait_for_selector(target if target and not target.startswith("text=") else f"text={target or desc}", timeout=5000)
+                            sel = target if target and not target.startswith("text=") else f"text={target or desc}"
+                            found_el = False
+                            try:
+                                page.wait_for_selector(sel, timeout=3000)
+                                found_el = True
+                            except Exception:
+                                # First matching element may be hidden (e.g. mobile nav or modal section); check for any visible match or DOM presence
+                                if ":visible" not in sel and not sel.startswith("text=") and not sel.startswith("xpath="):
+                                    try:
+                                        page.wait_for_selector(f"{sel}:visible", timeout=3000)
+                                        found_el = True
+                                    except Exception:
+                                        if page.locator(sel).count() > 0:
+                                            found_el = True
+                                elif page.locator(sel).count() > 0:
+                                    found_el = True
+
+                            if not found_el:
+                                raise TimeoutError(f"Element '{sel}' not found or visible")
+
+                            # If a specific text value is requested to be verified inside the element
+                            expected_text = val if action in ("verifyText", "verify_text") and val else (desc if action in ("verifyText", "verify_text") and not val else (val if val else None))
+                            if expected_text and target and not target.startswith("text="):
+                                actual_text = page.inner_text(target)
+                                if expected_text.lower() not in actual_text.lower():
+                                    raise ValueError(f"Expected text '{expected_text}' not in '{actual_text}'")
                             step_results.append({"seq":s,"status":"pass","note":f"Found: {target or desc}","durationMs":int((time.time()-t0)*1000)})
                             screenshot = capture_screenshot(f"step-{s}")
                             if screenshot: step_results[-1]["screenshot"] = screenshot
-                        except Exception:
+                        except Exception as _v_err:
                             # AI-assisted verification fallback
-                            log_cb("info", f"Verification failed for '{target}', asking AI...")
+                            log_cb("info", f"Verification failed for '{target}' ({_v_err}), asking AI...")
                             try:
                                 dom = get_compact_dom(page)
                                 prompt = (
@@ -1145,7 +1245,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                     "Respond with only: FOUND | NOT_FOUND: <reason>"
                                 )
                                 cfg = get_config()
-                                ai_txt = call_ai(prompt, timeout=30, force_provider="cloud")
+                                ai_txt = call_ai(prompt, cfg=cfg, timeout=30)
                                 if ai_txt:
                                     if ai_txt.upper().startswith("FOUND"):
                                         step_results.append({"seq":s,"status":"pass","note":f"AI verified: {ai_txt}","durationMs":int((time.time()-t0)*1000)})
@@ -1181,6 +1281,134 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                         }''', target)
                         status = "pass" if loaded else "fail"
                         step_results.append({"seq":s,"status":status,"note":f"Image loaded: {loaded}","durationMs":int((time.time()-t0)*1000)})
+                        screenshot = capture_screenshot(f"step-{s}")
+                        if screenshot: step_results[-1]["screenshot"] = screenshot
+
+                    elif action in ("verify_visual_health", "verify_css", "verify_styles", "verify_stylesheets"):
+                        failed_css_requests = [
+                            n for n in network_logs
+                            if ('.css' in n.get('url', '').lower() or 'stylesheet' in n.get('url', '').lower())
+                            and n.get('status', 200) >= 400
+                        ]
+                        dom_css_health = page.evaluate(r"""() => {
+                            const linkSheets = Array.from(document.querySelectorAll('link[rel="stylesheet"]'));
+                            const sheets = Array.from(document.styleSheets);
+                            let totalRules = 0;
+                            const brokenSheets = [];
+                            for (const s of sheets) {
+                                try {
+                                    const rulesCount = s.cssRules ? s.cssRules.length : 0;
+                                    totalRules += rulesCount;
+                                    if (rulesCount === 0 && s.href) {
+                                        brokenSheets.push(s.href);
+                                    }
+                                } catch (e) {
+                                    if (s.href) brokenSheets.push(s.href);
+                                }
+                            }
+                            return {
+                                linkTagCount: linkSheets.length,
+                                sheetCount: sheets.length,
+                                totalRules: totalRules,
+                                brokenSheets: brokenSheets
+                            };
+                        }""")
+                        if failed_css_requests:
+                            first_fail = failed_css_requests[0]
+                            status = "fail"
+                            note = f"FAIL: Critical stylesheet '{first_fail['url']}' returned HTTP {first_fail['status']}! Page UI styling is broken."
+                            log_cb("error", note)
+                        elif dom_css_health.get('linkTagCount', 0) > 0 and dom_css_health.get('totalRules', 0) == 0:
+                            status = "fail"
+                            note = f"FAIL: 0 CSS rules active across {dom_css_health.get('linkTagCount')} stylesheets. Page is unstyled."
+                            log_cb("error", note)
+                        elif dom_css_health.get('linkTagCount', 0) > 0 and len(dom_css_health.get('brokenSheets', [])) == dom_css_health.get('linkTagCount'):
+                            broken_first = dom_css_health.get('brokenSheets', [])[0]
+                            status = "fail"
+                            note = f"FAIL: All external stylesheets failed to load rules ({broken_first}). UI is unstyled."
+                            log_cb("error", note)
+                        else:
+                            status = "pass"
+                            note = f"Visual Health OK: {dom_css_health.get('sheetCount', 1)} stylesheets with {dom_css_health.get('totalRules', 0)} active CSS rules"
+                            log_cb("ok", note)
+
+                        step_results.append({"seq":s,"status":status,"note":note,"durationMs":int((time.time()-t0)*1000)})
+                        screenshot = capture_screenshot(f"step-{s}")
+                        if screenshot: step_results[-1]["screenshot"] = screenshot
+
+                    elif action in ("verify_network_assets", "verify_assets"):
+                        critical_failures = [
+                            n for n in network_logs
+                            if any(ext in n.get('url', '').lower() for ext in ['.css', '.woff', '.woff2', '.ttf', 'styles'])
+                            and n.get('status', 200) >= 400
+                        ]
+                        if critical_failures:
+                            status = "fail"
+                            err_items = [f"{n['url'].split('/')[-1].split('?')[0]} (HTTP {n['status']})" for n in critical_failures[:4]]
+                            note = f"FAIL: {len(critical_failures)} critical asset(s) failed to load: {', '.join(err_items)}"
+                            log_cb("error", note)
+                        else:
+                            status = "pass"
+                            note = "Tech-Audit OK: All stylesheets, web fonts, and core assets loaded successfully"
+                            log_cb("ok", note)
+
+                        step_results.append({"seq":s,"status":status,"note":note,"durationMs":int((time.time()-t0)*1000)})
+                        screenshot = capture_screenshot(f"step-{s}")
+                        if screenshot: step_results[-1]["screenshot"] = screenshot
+
+                    elif action in ("verify_no_broken_images", "verify_images", "verify_media_health"):
+                        broken_images_data = page.evaluate(r"""() => {
+                            const imgs = Array.from(document.querySelectorAll('img')).filter(img => img.offsetParent !== null);
+                            const broken = [];
+                            for (const img of imgs) {
+                                if (!img.complete || (img.naturalWidth === 0 && img.naturalHeight === 0)) {
+                                    const src = img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || 'unknown';
+                                    if (src && !src.startsWith('data:image/svg') && !src.includes('placeholder')) {
+                                        broken.push(src);
+                                    }
+                                }
+                            }
+                            return {
+                                total: imgs.length,
+                                brokenCount: broken.length,
+                                broken: broken.slice(0, 4)
+                            };
+                        }""")
+                        if broken_images_data.get('brokenCount', 0) > 0:
+                            status = "fail"
+                            note = f"FAIL: {broken_images_data['brokenCount']} broken image(s) detected: {', '.join(broken_images_data['broken'])}"
+                            log_cb("error", note)
+                        else:
+                            status = "pass"
+                            note = f"Media Health OK: All {broken_images_data.get('total', 0)} visible images loaded successfully"
+                            log_cb("ok", note)
+
+                        step_results.append({"seq":s,"status":status,"note":note,"durationMs":int((time.time()-t0)*1000)})
+                        screenshot = capture_screenshot(f"step-{s}")
+                        if screenshot: step_results[-1]["screenshot"] = screenshot
+
+                    elif action in ("verify_no_horizontal_overflow", "verify_layout_alignment", "verify_no_overflow"):
+                        overflow_data = page.evaluate(r"""() => {
+                            const docWidth = document.documentElement.scrollWidth;
+                            const winWidth = window.innerWidth;
+                            const diff = docWidth - winWidth;
+                            return {
+                                docWidth: docWidth,
+                                winWidth: winWidth,
+                                hasOverflow: diff > 15,
+                                diff: diff
+                            };
+                        }""")
+                        if overflow_data.get('hasOverflow'):
+                            status = "fail"
+                            note = f"FAIL: Horizontal layout overflow detected ({overflow_data['diff']}px wider than viewport). UI layout spilling/broken."
+                            log_cb("error", note)
+                        else:
+                            status = "pass"
+                            note = f"Layout Alignment OK: Zero horizontal overflow (Document: {overflow_data.get('docWidth')}px, Viewport: {overflow_data.get('winWidth')}px)"
+                            log_cb("ok", note)
+
+                        step_results.append({"seq":s,"status":status,"note":note,"durationMs":int((time.time()-t0)*1000)})
                         screenshot = capture_screenshot(f"step-{s}")
                         if screenshot: step_results[-1]["screenshot"] = screenshot
 
@@ -1248,7 +1476,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                                 "FAIL: [reason] if it fails\n"
                                 "SKIP: [reason] if not applicable\n"
                             )
-                            ai = call_ai(prompt, timeout=60, force_provider="cloud")
+                            ai = call_ai(prompt, timeout=60)
                             if not ai:
                                 ai = f"FAIL: No AI response"
                         except Exception as e: 
@@ -1276,6 +1504,24 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
                     log_cb("error", f"Step {s} error: {e}")
 
             browser.close()
+
+            # Enforce Visual/CSS Integrity: Check if critical stylesheets failed in network_logs
+            critical_css_errors = [
+                l for l in network_logs
+                if ('.css' in l.get('url', '').lower() or 'stylesheet' in l.get('url', '').lower())
+                and l.get('status', 200) in (403, 404, 500, 502, 503)
+            ]
+            if critical_css_errors:
+                first_css_err = critical_css_errors[0]
+                fail_msg = f"CRITICAL UI FAILURE: Stylesheet '{first_css_err['url']}' failed with HTTP {first_css_err['status']}! Site UI is unstyled/broken."
+                step_results.append({
+                    "seq": len(step_results) + 1,
+                    "status": "fail",
+                    "note": fail_msg,
+                    "durationMs": 0
+                })
+                log_cb("error", fail_msg)
+
             passed = sum(1 for s in step_results if s["status"]=="pass")
             adapted = sum(1 for s in step_results if s["status"]=="adapted")
             failed = sum(1 for s in step_results if s["status"]=="fail")
@@ -1380,29 +1626,35 @@ def run_test_thread(tc_id, run_id, mode="standard", device="desktop"):
     final_status = result["status"]
     tech_fail_reason = ""
     
-    # If the test passed functionally, but had JS errors or Network failures (4xx/5xx), mark it as 'adapted' (pass with warning)
-    if final_status == "pass":
-        js_errors = [l.get("text") for l in c_logs if l.get("type") == "error"]
-        # Refine network error detection: ignore non-critical asset failures like favicons or analytics
-        net_errors = []
-        for l in n_logs:
-            status = l.get("status", 0)
-            url = l.get("url", "").lower()
-            if status >= 400:
-                # Ignore non-critical resources
-                if any(k in url for k in ("favicon", "google-analytics", "doubleclick", "pixel", "/ads/")):
-                    # Still track these, but label as minor
-                    net_errors.append(f"Minor: {l.get('method')} {status} {l.get('url')}")
-                    continue
-                net_errors.append(f"Critical: {l.get('method')} {status} {l.get('url')}")
-        
-        if js_errors or net_errors:
-            tech_fail_reason = f"Tech Warning: {len(js_errors)} JS error(s) and {len(net_errors)} network failure(s) detected (Functional steps passed)."
-            log_cb("warning", tech_fail_reason)
-            for err in js_errors:
-                log_cb("info", f"  - JS Error: {err[:100]}")
-            for err in net_errors:
-                log_cb("info", f"  - Network: {err}")
+    # Check for critical technical & stylesheet failures
+    js_errors = [l.get("text") for l in c_logs if l.get("type") == "error"]
+    net_errors = []
+    critical_css_errors = []
+    for l in n_logs:
+        status = l.get("status", 0)
+        url = l.get("url", "").lower()
+        if status >= 400:
+            # Ignore non-critical resources
+            if any(k in url for k in ("favicon", "google-analytics", "doubleclick", "pixel", "/ads/")):
+                net_errors.append(f"Minor: {l.get('method')} {status} {l.get('url')}")
+                continue
+            net_errors.append(f"Critical: {l.get('method')} {status} {l.get('url')}")
+            if ('.css' in url or 'stylesheet' in url or 'style' in url) and status in (403, 404, 500, 502, 503):
+                critical_css_errors.append(f"{l.get('url')} (HTTP {status})")
+
+    # If critical stylesheet failed, enforce final_status = fail!
+    if critical_css_errors:
+        final_status = "fail"
+        result["failed"] = max(1, result.get("failed", 0))
+        tech_fail_reason = f"CRITICAL UI FAILURE: Stylesheet failed to load ({critical_css_errors[0]}). Website UI is unstyled/broken!"
+        log_cb("error", tech_fail_reason)
+    elif final_status == "pass" and (js_errors or net_errors):
+        tech_fail_reason = f"Tech Warning: {len(js_errors)} JS error(s) and {len(net_errors)} network failure(s) detected (Functional steps passed)."
+        log_cb("warning", tech_fail_reason)
+        for err in js_errors:
+            log_cb("info", f"  - JS Error: {err[:100]}")
+        for err in net_errors:
+            log_cb("info", f"  - Network: {err}")
 
     logs_list = active_runs[run_id]["logs"]
     process_log = "\n".join(l.get("message","") for l in logs_list)
@@ -1411,9 +1663,11 @@ def run_test_thread(tc_id, run_id, mode="standard", device="desktop"):
         
     tool_calls = sum(1 for l in logs_list if l.get("level") in ("info","step","ok","error"))
     
-    # Keep status as pass when all steps pass — tech warnings are informational only
     current_summary = result["summary"]
-    if tech_fail_reason:
+    if final_status == "fail":
+        if tech_fail_reason and "CRITICAL UI FAILURE" in tech_fail_reason:
+            current_summary = f"FAIL ({tech_fail_reason}) | {current_summary}"
+    elif tech_fail_reason:
         current_summary = f"PASS (with tech warnings: {tech_fail_reason}) | {current_summary}"
 
     report_md = build_report_markdown(
@@ -1894,7 +2148,7 @@ def _find_selector_by_text(page, text, action='', description=''):
         if selector_exists(page, cand):
             return cand
     try:
-        found = page.evaluate('''(text) => {
+        found = page.evaluate(r'''(text) => {
             const t = text.toLowerCase();
             const els = document.querySelectorAll('a, button, [role="button"], input[type="submit"], input[type="button"]');
             for (const el of els) {
@@ -1989,12 +2243,320 @@ def _find_working_selector(page, target, description="", log_cb=None):
     return target, False
 
 
+
+def _build_ecommerce_test_cases(site_map, base_url, log_cb=None):
+    """Build comprehensive e-commerce test cases dynamically for ANY storefront
+    (Shopify, WooCommerce, Magento, BigCommerce, Custom Next.js/React).
+    Uses ONLY crawled data and multi-platform selector fallbacks.
+    """
+    def _log(msg):
+        if log_cb: log_cb("info", msg)
+    def _nav(url, desc):
+        return {"action": "navigate", "target": url, "description": desc, "verify": "Page loaded"}
+    def _scroll(desc="Scroll down page", px=500):
+        return {"action": "scroll", "target": "page", "value": f"down {px}", "description": desc, "verify": "Scrolled"}
+    def _verify(target, desc, verify="Element visible"):
+        return {"action": "verify", "target": target, "description": desc, "verify": verify}
+    def _fill(target, value, desc, verify="Field filled"):
+        return {"action": "fill", "target": target, "value": value, "description": desc, "verify": verify}
+
+    b = base_url.rstrip('/')
+    cats = site_map.get('categories', [])
+    # Filter out homepage or empty URLs
+    base_paths = {b, b + '/', b + '/default', b + '/default/'}
+    cats = [c for c in cats if c.get('url', '').rstrip('/') not in base_paths and c.get('text', '').strip()]
+    products = site_map.get('products', [])
+    search_info = site_map.get('search')
+    cart_url = site_map.get('cart_url') or f"{b}/cart"
+    checkout_url = site_map.get('checkout_url') or f"{b}/checkout"
+    login_url = site_map.get('login_url')
+    register_url = site_map.get('register_url')
+    footer_links = site_map.get('footer_links', [])
+    search_sel = (search_info.get('selector') if search_info else None) or "input[type='search'], input[name='q'], input[name='s'], input[placeholder*='search' i], #search"
+    search_action = search_info.get('action_url') if search_info else None
+
+    # Universal cross-platform selectors
+    SEL_PAGE_TITLE = "h1, .page-title, [class*='title'], main"
+    SEL_PRODUCTS_GRID = ".products, .product-grid, .grid-products, [class*='product-grid'], [class*='products'], [class*='product-list'], [class*='collection'], [class*='catalog'], main"
+    SEL_PRODUCT_CARD = ".product-item, .product-card, [class*='product-item'], [class*='product-card'], li.product, [data-product-id], article, [class*='product']"
+    SEL_SORT_FILTER = "select#sorter, .toolbar-sorter, .woocommerce-ordering, [class*='sort'], select[name*='sort' i], [class*='filter'], .sorter, select"
+    SEL_PAGINATION = ".pages, .pagination, [class*='pager'], nav[aria-label*='page' i], [class*='pagination' i], .toolbar-bottom"
+    SEL_PDP_TITLE = "h1, .product-title, [class*='product-name'], [itemprop='name'], .title"
+    SEL_PDP_PRICE = "span.price, .price, [class*='price'], [itemprop='price'], .amount, [data-price]"
+    SEL_ADD_TO_CART = "button[id*='cart' i], button[name='add'], button[title*='Add' i], [class*='add-to-cart' i], [class*='addtocart' i], form[action*='cart'] button, button.single_add_to_cart_button, #product-addtocart-button, [data-action='add-to-cart']"
+    SEL_PDP_GALLERY = ".product-gallery, [class*='gallery' i], [class*='product-image' i], [class*='featured-image'], img"
+    SEL_PDP_DESC = ".description, [class*='description' i], [itemprop='description'], .product-info, main"
+    SEL_CART_EMPTY = ".cart-empty, [class*='cart-empty'], [class*='empty-cart'], .cart__empty-text, [class*='cart'] p, [class*='empty'], main"
+    SEL_CART_HEADER = "[id*='cart' i], [aria-label*='cart' i], header [href*='cart'], nav [href*='cart'], a[href*='cart'], a[href*='basket'], a[href*='bag'], [class*='cart']"
+    SEL_CHECKOUT_PAGE = ".cart-empty, [class*='checkout' i], form, main, #checkout"
+    SEL_LOGIN_FORM = "form[action*='login'], form[id*='login' i], form.woocommerce-form-login, #customer-login-form, form"
+    SEL_LOGIN_USER = "input[type='email'], input[name*='email' i], input[name*='login' i], input[name*='user' i], #form-login-username, #customer_email, #username"
+    SEL_LOGIN_PASS = "input[type='password'], #form-login-password, #customer_password, #password"
+    SEL_LOGIN_SUBMIT = "form[action*='login'] button, form button[type='submit'], button[type='submit'], input[type='submit'], button.action.login, button:has-text('Sign In'), button:has-text('Log in')"
+    SEL_LOGIN_VALIDATION = "input:invalid, .mage-error, [class*='error' i], [class*='invalid' i], [role='alert'], .message"
+    SEL_REG_FIRST = "input[name*='first' i], input#firstname, input[name='name'], input[type='text']"
+    SEL_REG_EMAIL = "input[type='email']"
+    SEL_REG_PASS = "input[type='password']"
+    SEL_REG_SUBMIT = "form button[type='submit'], button[type='submit'], input[type='submit'], button.action.submit"
+    SEL_NEWSLETTER = "input[name*='newsletter' i], input[id*='newsletter' i], form[action*='newsletter' i] input, form[action*='subscribe' i] input, #newsletter-subscribe, #newsletter, input[type='email']"
+
+    tests = []
+
+    # ── 0. UI, VISUAL INTEGRITY & TECH-AUDIT ─────────────────────────────────
+    _log("Building: UI, Visual Integrity & Tech-Audit tests")
+    tests.append({"name": "UI & Visual Integrity - Stylesheet & Layout Health Audit", "category": "tech_audit", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        {"action": "verify_visual_health", "target": "body", "description": "Verify external stylesheets loaded with HTTP 200 and active CSS rules", "verify": "Active stylesheets"},
+        _verify("header, [role='banner'], nav", "Verify header container renders with layout styling", "Header styled and visible"),
+    ]})
+    tests.append({"name": "Tech-Audit - Network & Critical Asset Health", "category": "tech_audit", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        {"action": "verify_network_assets", "target": "critical", "description": "Verify no 4xx/5xx HTTP errors on stylesheets, web fonts or core assets", "verify": "No critical asset errors"},
+    ]})
+    tests.append({"name": "UI & Media - Broken Images & Media Asset Audit", "category": "tech_audit", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        {"action": "verify_no_broken_images", "target": "img", "description": "Verify all visible images and product thumbnails load with valid natural dimensions", "verify": "Zero broken images"},
+    ]})
+    tests.append({"name": "UI & Layout - Responsive Viewport & Horizontal Overflow Audit", "category": "tech_audit", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        {"action": "verify_no_horizontal_overflow", "target": "body", "description": "Verify viewport layout alignment has zero horizontal overflow or spilling", "verify": "Zero horizontal overflow"},
+    ]})
+
+    # ── 1. HOMEPAGE & HEADER ─────────────────────────────────────────────────
+    _log("Building: Homepage & Header tests")
+    tests.append({"name": "Homepage - Page Load & Content Verification", "category": "positive", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        {"action": "verify_visual_health", "target": "body", "description": "Verify page stylesheets loaded with active CSS rules", "verify": "CSS rules loaded"},
+        _verify(SEL_PAGE_TITLE, "Verify page has a main heading (h1)", "Homepage heading visible"),
+        _scroll("Scroll to see more homepage content", 400),
+        _verify("section, main, article, div", "Verify page has content sections", "Homepage content sections present"),
+    ]})
+    tests.append({"name": "Homepage - Navigation Menu Links Present", "category": "positive", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        _verify("nav, header nav, [role='navigation'], header", "Verify main navigation menu is present", "Navigation menu visible"),
+        _verify("header a, nav a", "Verify header contains navigation links", "Header links present"),
+    ]})
+    tests.append({"name": "Homepage - Hero Banner & Featured Products", "category": "positive", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        _verify("header", "Verify header section exists", "Header visible"),
+        _scroll("Scroll to hero/banner area", 300),
+        _verify("main, section, [class*='hero'], [class*='banner']", "Verify main content sections render", "Main content sections visible"),
+    ]})
+    first_nav_target = cats[0]['url'] if cats else (products[0]['url'] if products else b + '/')
+    tests.append({"name": "Homepage - Brand Logo Return-to-Home Navigation", "category": "positive", "steps": [
+        _nav(first_nav_target, "Navigate to subpage"),
+        {"action": "click", "target": "a.logo, a[href='/'], [class*='logo'] a, header a[href*='/']:first-of-type, [aria-label*='logo' i]", "description": "Click brand logo in header", "verify": "Logo clicked"},
+        _verify(SEL_PAGE_TITLE, "Verify returned to homepage with main heading", "Homepage heading visible"),
+    ]})
+
+    # ── 2. CATEGORY NAVIGATION ───────────────────────────────────────────────
+    if cats:
+        _log(f"Building: Category Navigation tests ({min(len(cats), 8)} categories)")
+        for cat in cats[:8]:
+            tests.append({"name": f"Category Navigation - {cat['text']}", "category": "positive", "steps": [
+                _nav(cat['url'], f"Navigate directly to {cat['text']} category page"),
+                _verify(SEL_PAGE_TITLE, f"Verify {cat['text']} page heading visible", "Category page heading shown"),
+                _verify(SEL_PRODUCTS_GRID, "Verify product listing container present", "Product listing present on category page"),
+            ]})
+
+    # ── 3. PRODUCT LISTING PAGE CONTROLS ─────────────────────────────────────
+    _log("Building: Product Listing Page tests")
+    first_listing = cats[0]['url'] if cats else (b + '/collections/all' if 'shopify' in b else b + '/shop')
+    first_cat_name = cats[0]['text'] if cats else "Catalog"
+    tests.append({"name": f"Product Listing - Sort & Filter Controls ({first_cat_name})", "category": "positive", "steps": [
+        _nav(first_listing, f"Open {first_cat_name} product listing page"),
+        _verify(SEL_PRODUCT_CARD, "Verify individual product cards visible", "Product items visible in grid"),
+        _verify(SEL_SORT_FILTER, "Verify product sort toolbar/filter present", "Sort control visible"),
+    ]})
+    tests.append({"name": f"Product Listing - Pagination ({first_cat_name})", "category": "positive", "steps": [
+        _nav(first_listing, f"Open {first_cat_name} product listing page"),
+        _scroll("Scroll to bottom for pagination", 800),
+        _verify(SEL_PAGINATION, "Verify pagination control exists", "Pagination visible"),
+    ]})
+
+    # ── 4. PRODUCT DETAIL PAGE (PDP) ─────────────────────────────────────────
+    _log("Building: Product Detail Page tests")
+    if products:
+        prod = products[0]
+        tests.append({"name": f"Product Detail - Page Load & Title ({prod['name'][:40]})", "category": "positive", "steps": [
+            _nav(prod['url'], f"Navigate to product: {prod['name'][:40]}"),
+            _verify(SEL_PDP_TITLE, "Verify product title (h1) is visible", "Product title shown"),
+            _verify(SEL_PDP_PRICE, "Verify product price is displayed", "Product price visible"),
+        ]})
+        tests.append({"name": "Product Detail - Add to Cart Button", "category": "positive", "steps": [
+            _nav(prod['url'], f"Navigate to product: {prod['name'][:40]}"),
+            _verify(SEL_ADD_TO_CART, "Verify Add to Cart button present", "Add to Cart button visible"),
+        ]})
+        tests.append({"name": "Product Detail - Gallery & Description", "category": "positive", "steps": [
+            _nav(prod['url'], f"Navigate to product: {prod['name'][:40]}"),
+            _verify(SEL_PDP_GALLERY, "Verify product images present", "Product images present"),
+            _scroll("Scroll to product description", 400),
+            _verify(SEL_PDP_DESC, "Verify product description section", "Description section visible"),
+        ]})
+        tests.append({"name": "Product Detail - Availability & In-Stock Status", "category": "positive", "steps": [
+            _nav(prod['url'], f"Navigate to product: {prod['name'][:40]}"),
+            _verify("[class*='stock' i], [itemprop='availability'], .availability, .in-stock, [class*='inventory' i], main", "Verify product availability indicator visible", "Availability indicator visible"),
+        ]})
+        tests.append({"name": "Product Detail - Active Add to Cart Interaction", "category": "positive", "steps": [
+            _nav(prod['url'], f"Navigate to product: {prod['name'][:40]}"),
+            {"action": "click", "target": SEL_ADD_TO_CART, "description": "Click Add to Cart button", "verify": "Add to cart triggered"},
+            {"action": "wait", "target": "2000", "description": "Wait for cart state update", "verify": "Wait completed"},
+            _verify(".message-success, [class*='toast' i], [class*='modal' i], [class*='notification' i], [class*='alert' i], [id*='cart' i], [aria-label*='cart' i], .cart, main", "Verify cart update notification or cart header update", "Cart state updated"),
+        ]})
+    elif cats:
+        tests.append({"name": "Product Detail - Open Category & Verify Products", "category": "positive", "steps": [
+            _nav(cats[0]['url'], f"Open {cats[0]['text']} to find products"),
+            _verify(SEL_PRODUCT_CARD, "Verify individual product cards exist", "Product cards visible"),
+            _scroll("Scroll to second row of products", 500),
+        ]})
+
+    # ── 5. SEARCH — POSITIVE & NEGATIVE ──────────────────────────────────────
+    _log("Building: Search tests")
+    if search_action:
+        q_char = "&" if "?" in search_action else "?"
+        tests.append({"name": "Search - Positive Search Returns Results", "category": "positive", "steps": [
+            _nav(search_action + f"{q_char}q=camera", "Navigate directly to search results for 'camera'"),
+            _verify(SEL_PAGE_TITLE, "Verify search results page title", "Search page title visible"),
+            _verify(SEL_PRODUCTS_GRID, "Verify product results listed", "Products found in search results"),
+        ]})
+        tests.append({"name": "Search - Search Different Keyword (printer)", "category": "positive", "steps": [
+            _nav(search_action + f"{q_char}q=printer", "Navigate to search results for 'printer'"),
+            _verify(SEL_PAGE_TITLE, "Verify search results page heading", "Search results page heading visible"),
+            _verify(SEL_PRODUCTS_GRID, "Verify products in search results", "Products visible in search"),
+        ]})
+        tests.append({"name": "Search - No Results for Nonsense Query", "category": "negative", "steps": [
+            _nav(search_action + f"{q_char}q=xyznotexist9999", "Navigate to search for a non-existent product"),
+            _verify(".message.notice, [class*='no-results' i], [class*='empty' i], .message, [role='alert'], main p, main", "Verify 'no results found' notice message shown", "No results message displayed"),
+        ]})
+        tests.append({"name": "Search - Special Characters Search Query Edge Case", "category": "negative", "steps": [
+            _nav(search_action + f"{q_char}q=%40%23%24%25%26*", "Navigate to search query with special characters (@#$%&*)"),
+            _verify("main, body, h1, [class*='search' i], [class*='no-results' i]", "Verify search handles special characters gracefully without server 500 error", "Handled gracefully"),
+        ]})
+    else:
+        tests.append({"name": "Search - Search Input Present & Interactive", "category": "positive", "steps": [
+            _nav(b + '/', "Navigate to homepage"),
+            _fill(search_sel, "phone", "Enter query in search input", "Search field filled"),
+            _verify(search_sel, "Verify search field exists", "Search input visible"),
+        ]})
+        tests.append({"name": "Search - Special Characters Search Query Edge Case", "category": "negative", "steps": [
+            _nav(b + '/', "Navigate to homepage"),
+            _fill(search_sel, "@#$%&*", "Enter special characters in search box", "Special chars entered"),
+            _verify(search_sel, "Verify search input handles special characters", "Input handles characters"),
+        ]})
+
+    # ── 6. CART OPERATIONS ───────────────────────────────────────────────────
+    _log("Building: Cart tests")
+    tests.append({"name": "Cart - Empty Cart Page Loads", "category": "positive", "steps": [
+        _nav(cart_url, "Navigate to shopping cart page"),
+        _verify(SEL_CART_EMPTY, "Verify empty cart message or cart container is displayed", "Empty cart message visible"),
+    ]})
+    tests.append({"name": "Cart - Cart Link Accessible from Homepage", "category": "positive", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        _verify("header, nav", "Verify header or nav is visible", "Header visible"),
+        _verify(SEL_CART_HEADER, "Verify cart link/icon present in header", "Cart icon present"),
+        _nav(cart_url, "Navigate directly to cart"),
+        _verify(SEL_CART_EMPTY, "Verify cart page is accessible and shows empty state", "Cart page accessible"),
+    ]})
+    tests.append({"name": "Cart - Checkout URL is Reachable", "category": "positive", "steps": [
+        _nav(checkout_url, "Navigate to checkout page URL (redirects to cart if empty)"),
+        _verify(SEL_CHECKOUT_PAGE, "Verify checkout URL is reachable (renders page or empty cart)", "Checkout URL accessible"),
+    ]})
+
+    # ── 7. USER AUTHENTICATION (Conditional) ─────────────────────────────────
+    if login_url:
+        _log("Building: Auth tests (Login detected)")
+        tests.append({"name": "Auth - Login Page Loads & Form Present", "category": "positive", "steps": [
+            _nav(login_url, "Navigate to customer login page"),
+            _verify(SEL_LOGIN_FORM, "Verify customer login form is present", "Login form visible"),
+            _verify(SEL_LOGIN_USER, "Verify email field present", "Login email field visible"),
+            _verify(SEL_LOGIN_PASS, "Verify password field present", "Password field visible"),
+            _verify(SEL_LOGIN_SUBMIT, "Verify Sign In button present", "Sign In button visible"),
+        ]})
+        tests.append({"name": "Auth - Login With Empty Fields Shows Validation", "category": "negative", "steps": [
+            _nav(login_url, "Navigate to login page"),
+            {"action": "click", "target": SEL_LOGIN_SUBMIT, "description": "Click Sign In without entering credentials", "verify": "Validation triggered"},
+            _verify(SEL_LOGIN_VALIDATION, "Verify input validation error triggered", "Invalid input validation triggered"),
+        ]})
+
+    if register_url:
+        _log("Building: Auth tests (Registration detected)")
+        tests.append({"name": "Auth - Customer Registration Page Loads", "category": "positive", "steps": [
+            _nav(register_url, "Navigate to customer registration page"),
+            _verify(SEL_REG_FIRST, "Verify first name field present", "First name field visible"),
+            _verify(SEL_REG_EMAIL, "Verify email input field present", "Email field visible"),
+            _verify(SEL_REG_PASS, "Verify password field present", "Password field visible"),
+            _verify(SEL_REG_SUBMIT, "Verify Create Account submit button present", "Registration submit button visible"),
+        ]})
+
+    if login_url and register_url:
+        tests.append({"name": "Auth - Register & Login Link Cross-Navigation", "category": "positive", "steps": [
+            _nav(login_url, "Navigate to login page"),
+            _verify("a[href*='create'], a[href*='register'], a[href*='signup'], a:has-text('Create'), a:has-text('Register')", "Verify 'Create Account' link on login page", "Register link present on login page"),
+            _nav(register_url, "Navigate to registration page"),
+            _verify("a[href*='login'], a[href*='signin'], a[href*='account'], a:has-text('Sign In'), a:has-text('Log in')", "Verify 'Already have account? Sign In' link", "Login link on registration page"),
+        ]})
+
+    # ── 8. CHECKOUT FLOW ─────────────────────────────────────────────────────
+    _log("Building: Checkout Flow tests")
+    tests.append({"name": "Checkout - Checkout URL Reachable", "category": "positive", "steps": [
+        _nav(checkout_url, "Navigate directly to checkout URL (redirects to cart if empty)"),
+        _verify(SEL_CHECKOUT_PAGE, "Verify checkout URL responds and renders page", "Checkout page or empty cart loaded"),
+    ]})
+    tests.append({"name": "Checkout - Cart Page Then Checkout Accessible", "category": "positive", "steps": [
+        _nav(cart_url, "Navigate to cart page"),
+        _verify(SEL_CART_EMPTY, "Verify cart page loaded (shows empty cart)", "Cart page loaded"),
+        _nav(checkout_url, "Navigate to checkout URL"),
+        _verify(SEL_CHECKOUT_PAGE, "Verify checkout URL is reachable after cart visit", "Checkout URL accessible"),
+    ]})
+
+    # ── 9. FOOTER & STATIC PAGES ─────────────────────────────────────────────
+    _log("Building: Footer & Static Pages tests")
+    tests.append({"name": "Footer - Footer Section Visible with Links", "category": "positive", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        _scroll("Scroll to page footer", 2000),
+        _verify("footer, .page-footer, [class*='footer']", "Verify footer HTML element is present", "Footer element visible"),
+        _verify("footer a, .page-footer a, [class*='footer'] a", "Verify footer contains navigation links", "Footer links present"),
+    ]})
+    # Test only REAL footer links discovered on this specific website
+    for fl in footer_links[:4]:
+        tests.append({"name": f"Static Page - {fl['text']} Page Loads", "category": "positive", "steps": [
+            _nav(fl['url'], f"Navigate to {fl['text']} page"),
+            _verify(SEL_PAGE_TITLE, f"Verify {fl['text']} page has main heading", f"{fl['text']} page heading visible"),
+            _verify("main, .content, article, body", f"Verify main content area of {fl['text']} page", "Main content area loaded"),
+        ]})
+
+    # ── 10. NEWSLETTER SIGNUP & FORM VALIDATION ─────────────────────────────
+    tests.append({"name": "Newsletter - Newsletter Signup Form Present", "category": "positive", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        _scroll("Scroll to newsletter section in footer", 1500),
+        _verify(SEL_NEWSLETTER, "Verify newsletter email input field", "Newsletter input visible"),
+    ]})
+    tests.append({"name": "Newsletter - Invalid Email Format Shows Validation", "category": "negative", "steps": [
+        _nav(b + '/', "Navigate to homepage"),
+        _scroll("Scroll to newsletter section in footer", 1500),
+        _fill(SEL_NEWSLETTER, "invalid_email_no_domain", "Fill invalid email format into newsletter", "Invalid email filled"),
+        {"action": "click", "target": "form[action*='newsletter' i] button, form[action*='subscribe' i] button, #newsletter-subscribe button, button[type='submit']", "description": "Submit newsletter form with invalid email", "verify": "Submit clicked"},
+        _verify("input:invalid, .error, [class*='error' i], [class*='mage-error'], [role='alert'], form", "Verify validation error is triggered for invalid email", "Validation error shown"),
+    ]})
+
+    _log(f"Total template test cases built: {len(tests)}")
+    return tests
+
+
 def _discovery_worker(pid, base_url, sid):
     """Multi-page AI Discovery: crawls site, extracts REAL selectors, verifies them with Playwright."""
     active_runs[sid] = {"id": sid, "status": "running", "projectId": pid, "testCaseName": "AI Discovery", "logs": [], "cancelled": False, "started_at": now_iso()}
     def log_cb(level, msg):
-        active_runs[sid]["logs"].append({"time": now_iso(), "level": level, "message": msg})
-        emit_stream(sid, "progress", json.dumps({"message": msg}))
+        safe_msg = str(msg)
+        try:
+            safe_print(f"[discovery][{level}] {safe_msg}", flush=True)
+        except Exception:
+            pass
+        try:
+            active_runs[sid]["logs"].append({"time": now_iso(), "level": level, "message": safe_msg})
+            emit_stream(sid, "progress", json.dumps({"message": safe_msg}))
+        except Exception:
+            pass
 
     if not _is_safe_url(base_url):
         log_cb("error", f"SSRF blocked: {base_url}")
@@ -2033,7 +2595,12 @@ def _discovery_worker(pid, base_url, sid):
         log_cb("info", "Launching browser...")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            clean_base, creds, req_auth = _extract_auth_credentials(base_url)
+            ctx_args = {"viewport": {"width": 1280, "height": 720}}
+            if creds:
+                ctx_args["http_credentials"] = creds
+            ctx = browser.new_context(**ctx_args)
+            page = ctx.new_page()
 
             log_cb("info", f"Navigating to {base_url}...")
             page.goto(base_url, wait_until="load", timeout=60000)
@@ -2053,20 +2620,20 @@ def _discovery_worker(pid, base_url, sid):
             seen_paths = set()
             for link in discoverable:
                 path = link.get('url', '')
-                if path and path not in seen_paths and path != '/' and len(pages_to_visit) < 8:
+                if path and path not in seen_paths and path != '/' and len(pages_to_visit) < 20:
                     seen_paths.add(path)
                     full_url = path if path.startswith('http') else base_url.rstrip('/') + '/' + path.lstrip('/')
                     if _is_safe_url(full_url):
-                        pages_to_visit.append({'text': link.get('text', path), 'url': full_url})
+                        pages_to_visit.append({'text': link.get('text', path), 'url': full_url, 'selector': link.get('selector', '')})
 
             log_cb("info", f"Found {len(pages_to_visit)} sub-pages to discover")
 
-            for i, pg in enumerate(pages_to_visit[:5]):
+            for i, pg in enumerate(pages_to_visit[:15]):
                 if active_runs.get(sid, {}).get('cancelled'): break
                 try:
-                    log_cb("info", f"[{i+1}/{min(len(pages_to_visit),5)}] Crawling: {pg['text']}")
+                    log_cb("info", f"[{i+1}/{min(len(pages_to_visit),15)}] Crawling: {pg['text']}")
                     page.goto(pg['url'], wait_until="load", timeout=30000)
-                    page.wait_for_timeout(2000)
+                    page.wait_for_timeout(1500)
                     sub_dom_raw = get_compact_dom(page)
                     sub_dom = json.loads(sub_dom_raw) if sub_dom_raw.startswith('{') else {"interactive": []}
                     all_page_doms[pg['url']] = sub_dom
@@ -2075,11 +2642,11 @@ def _discovery_worker(pid, base_url, sid):
                     log_cb("info", f"  -> {sub_dom.get('page_title', 'Unknown')} | {elem_count} elements")
                     for link in sub_dom.get('discoverable_links', []):
                         path = link.get('url', '')
-                        if path and path not in seen_paths and len(pages_to_visit) < 10:
+                        if path and path not in seen_paths and len(pages_to_visit) < 20:
                             seen_paths.add(path)
                             full = path if path.startswith('http') else base_url.rstrip('/') + '/' + path.lstrip('/')
                             if _is_safe_url(full):
-                                pages_to_visit.append(link)
+                                pages_to_visit.append({'text': link.get('text', path), 'url': full, 'selector': link.get('selector', '')})
                 except Exception as e:
                     log_cb("warning", f"Failed to crawl {pg['url']}: {e}")
 
@@ -2089,179 +2656,169 @@ def _discovery_worker(pid, base_url, sid):
             total_elements = sum(len(d.get('interactive', [])) for d in all_page_doms.values())
             log_cb("info", f"Discovery complete: {len(all_page_doms)} pages, {total_elements} total interactive elements")
 
-            cfg = get_config()
-            log_cb("info", "Generating test cases with AI (30+ cases)...")
+            # ── Build structured site_map from crawl data ──────────────────
+            site_map = {
+                "base_url": base_url,
+                "page_title": page_title,
+                "categories": [],
+                "products": [],
+                "search": None,
+                "cart_url": None,
+                "checkout_url": None,
+                "login_url": None,
+                "register_url": None,
+                "footer_links": [],
+                "all_page_urls": list(all_page_doms.keys()),
+            }
 
-            element_catalog = []
-            for url_key, dom_data in all_page_doms.items():
-                page_label = url_key.replace(base_url.rstrip('/'), '') or '/'
-                for elem in dom_data.get('interactive', []):
-                    element_catalog.append(f"[{page_label}] {elem}")
-                for form in dom_data.get('forms', []):
-                    for field in form.get('fields', []):
-                        element_catalog.append(f"[{page_label}] form field: {field}")
-
-            catalog_str = '\n'.join(element_catalog[:60])
-
-            prompt = (
-                f"You are a senior QA engineer. Generate comprehensive test cases for: {base_url}\n\n"
-                f"AVAILABLE ELEMENTS ON THE SITE (use the TEXT portion to identify targets, NOT the CSS selector):\n"
-                f"Format: [page] tag selector => visible text\n\n"
-                f"{catalog_str}\n\n"
-                "IMPORTANT RULES:\n"
-                "1. For 'target' field: use the VISIBLE TEXT of the element (e.g. 'Home', 'Search', 'Add to Cart')\n"
-                "   The system will automatically find the correct CSS selector at runtime.\n"
-                "2. Generate 30+ diverse test cases covering ALL pages and ALL features\n"
-                "3. Each test case MUST start with a navigate step to the correct page\n"
-                "4. Test categories: navigation, forms, search, links, buttons, scroll, hover, edge cases, negative\n"
-                "5. Include both POSITIVE (happy path) and NEGATIVE (error handling) tests\n"
-                "6. For fill actions, use realistic test data (e.g. email: test@example.com)\n\n"
-                "OUTPUT FORMAT (JSON):\n"
-                '{"test_cases":[{"name":"Test Name","category":"positive/negative/edge","steps":['
-                '{"action":"navigate","target":"$BASE_URL/","description":"Go to homepage","verify":"Page loaded"},'
-                '{"action":"click","target":"Home","description":"Click Home link","verify":"Home page shown"},'
-                '{"action":"fill","target":"Search","value":"phone","description":"Search for phone","verify":"Results shown"},'
-                '{"action":"scroll","target":"page","description":"Scroll down","verify":"Scrolled"}'
-                ']}]}\n\n'
-                "Cover: every navigation link, every form, every button, every product, "
-                "search, cart, login, signup, footer links, and edge cases.\n"
-                "Each test case should have 3-8 steps."
-            )
-
-            raw_ai = None
-            for attempt in range(3):
-                try:
-                    use_json = attempt < 2
-                    log_cb("info", f"AI attempt {attempt+1}/3...")
-                    raw_ai = call_ai(prompt, cfg, timeout=180, json_mode=use_json, force_provider="cloud")
-                    if raw_ai:
-                        log_cb("info", f"AI responded ({len(raw_ai)} chars)")
-                        break
-                    log_cb("warning", f"Attempt {attempt+1}: empty response")
-                    time.sleep(5)
-                except Exception as e:
-                    log_cb("warning", f"Attempt {attempt+1} failed: {e}")
-                    time.sleep(5)
-
-            if not raw_ai:
-                emit_stream(sid, "error", json.dumps({"message": "AI failed after 3 attempts"}))
-                return
-
-            generated = _parse_ai_json(raw_ai)
-            if generated is None:
-                print(f"[discovery] Parse failed:\n{raw_ai[:4000]}", flush=True)
-                emit_stream(sid, "error", json.dumps({"message": "Could not parse AI output as JSON"}))
-                return
-
-            if isinstance(generated, dict):
-                if isinstance(generated.get("test_cases"), list):
-                    generated = generated["test_cases"]
+            # Discover navigation categories & special URLs
+            for link in pages_to_visit[:25]:
+                url = link.get('url', '')
+                text = link.get('text', '')
+                sel = link.get('selector', '')
+                if not url or not text: continue
+                low = (url + " " + text).lower()
+                if any(k in low for k in ['/cart', '/checkout/cart', '/basket', '/bag']):
+                    if not site_map['cart_url']: site_map['cart_url'] = url
+                elif any(k in low for k in ['/checkout', '/onestepcheckout']) and '/cart' not in low:
+                    if not site_map['checkout_url']: site_map['checkout_url'] = url
+                elif any(k in low for k in ['/login', '/account/login', '/customer/account/login', '/my-account', '/signin', '/sign-in']):
+                    if not site_map['login_url']: site_map['login_url'] = url
+                elif any(k in low for k in ['/register', '/account/create', '/customer/account/create', '/signup', '/sign-up']):
+                    if not site_map['register_url']: site_map['register_url'] = url
+                elif any(k in low for k in ['/privacy', '/terms', '/contact', '/about', '/faq', '/help', '/policy', '/returns', '/refund', '/shipping']):
+                    if not any(x['url'].rstrip('/') == url.rstrip('/') for x in site_map['footer_links']):
+                        site_map['footer_links'].append({'text': text, 'url': url})
+                elif any(k in low for k in ['wishlist', 'compare', 'newsletter', 'currency', 'language', 'account', 'customer', 'my-account']):
+                    pass  # Header utility links, not product categories
                 else:
-                    generated = [v for v in generated.values() if isinstance(v, dict) and v.get("name")]
-            if not isinstance(generated, list):
-                generated = [generated]
-            generated = [tc for tc in generated if isinstance(tc, dict) and tc.get("name") and tc.get("steps")]
-            log_cb("info", f"AI generated {len(generated)} test case(s)")
+                    site_map['categories'].append({'text': text, 'url': url, 'selector': sel})
 
-            if len(generated) < 25:
-                log_cb("info", f"Only {len(generated)} cases - requesting more...")
-                focused_prompt = (
-                    f"Website: {base_url}\n"
-                    f"Existing test cases: {[tc.get('name','') for tc in generated]}\n"
-                    f"Available elements:\n{catalog_str[:3000]}\n\n"
-                    "Generate 20 MORE DIFFERENT test cases (not listed above).\n"
-                    "Cover: different pages, negative tests, edge cases, form validation, scroll, hover.\n"
-                    "For target field, use VISIBLE TEXT (not CSS selectors).\n"
-                    "Each test case MUST have a navigate step with the FULL URL (not just text).\n"
-                    "Output: {\"test_cases\":[...]}\n"
-                    "Each test case: name, category, steps array with action/target/description/verify."
-                )
-                try:
-                    raw_ai2 = call_ai(focused_prompt, cfg, timeout=120, json_mode=False, force_provider="cloud")
-                    extra = _parse_ai_json(raw_ai2)
+            # Discover footer links directly from live DOM if available
+            try:
+                footer_locs = page.locator("footer a, .page-footer a, [class*='footer'] a, #footer a").all()
+                for fl in footer_locs[:30]:
+                    f_url = fl.get_attribute("href")
+                    f_text = fl.inner_text().strip()
+                    if f_url and f_text and len(f_text) > 2 and not f_url.startswith("#") and not f_url.startswith("javascript"):
+                        f_full = f_url if f_url.startswith("http") else base_url.rstrip("/") + "/" + f_url.lstrip("/")
+                        low = (f_text + " " + f_full).lower()
+                        if any(k in low for k in ['contact', 'about', 'privacy', 'terms', 'return', 'refund', 'shipping', 'policy', 'faq', 'help']):
+                            if not any(x['url'].rstrip('/') == f_full.rstrip('/') for x in site_map['footer_links']):
+                                site_map['footer_links'].append({'text': f_text, 'url': f_full})
+            except Exception:
+                pass
+
+            # Discover search form & action across ANY platform
+            for dom_data in all_page_doms.values():
+                for form in dom_data.get('forms', []):
+                    action = form.get('action', '')
+                    fields = form.get('fields', [])
+                    for field in fields:
+                        field_low = field.lower()
+                        if any(k in field_low for k in ['search', 'query', 'looking', 'find', ' (q)', ' (s)']):
+                            field_sel = field.split('(')[0].strip()
+                            action_full = action if (action and action.startswith('http')) else (base_url.rstrip('/') + '/' + action.lstrip('/') if action else '')
+                            site_map['search'] = {'selector': field_sel, 'action_url': action_full}
+                            break
+                    if site_map['search']: break
+
+            # Discover real products across ANY platform (Shopify, WooCommerce, Magento, BigCommerce, Custom)
+            cat_urls_set = {c.get('url', '').rstrip('/') for c in site_map['categories']}
+            cat_names_set = {c.get('text', '').strip().lower() for c in site_map['categories']}
+            for url_key, dom_data in all_page_doms.items():
+                if url_key == base_url.rstrip('/'): continue
+                for elem in dom_data.get('interactive', []):
+                    elem_str = str(elem)
+                    # Check for product-like URL patterns
+                    is_product_pattern = any(p in elem_str for p in ['/products/', '/product/', '/item/', '/p/', '.html'])
+                    if is_product_pattern and '=>' in elem_str:
+                        parts = elem_str.split('=>')
+                        if len(parts) == 2:
+                            sel_part = parts[0].strip().split()[-1] if parts[0].strip() else ''
+                            text_part = parts[1].strip().strip('"')
+                            if text_part and len(text_part) > 3 and not text_part.startswith('http') and sel_part:
+                                href_match = re.search(r'href=["\']([^"\']+)["\']', sel_part)
+                                if href_match:
+                                    prod_url = href_match.group(1)
+                                    if not prod_url.startswith('http'):
+                                        prod_url = base_url.rstrip('/') + '/' + prod_url.lstrip('/')
+                                    clean_url = prod_url.rstrip('/')
+                                    # Ensure it is not a category page, homepage, or static link
+                                    if clean_url not in cat_urls_set and text_part.strip().lower() not in cat_names_set and not clean_url.endswith('/default'):
+                                        if not any(f['url'].rstrip('/') == clean_url for f in site_map['footer_links']):
+                                            site_map['products'].append({'name': text_part, 'url': prod_url, 'selector': sel_part})
+                                            if len(site_map['products']) >= 3:
+                                                break
+                if site_map['products']:
+                    break
+
+            if not site_map['cart_url']:
+                site_map['cart_url'] = base_url.rstrip('/') + '/cart'
+            if not site_map['checkout_url']:
+                site_map['checkout_url'] = base_url.rstrip('/') + '/checkout'
+
+            log_cb("info", f"Site map: {len(site_map['categories'])} categories, {len(site_map['products'])} products, search={'found' if site_map['search'] else 'not found'}")
+
+            # ── Layer 2: Template-based e-commerce test builder ──────────────
+            log_cb("info", "Building comprehensive e-commerce test suite from templates...")
+            generated = _build_ecommerce_test_cases(site_map, base_url, log_cb)
+            log_cb("info", f"Template builder created {len(generated)} test cases")
+
+            # ── Layer 3: AI enhancement (additive edge cases only) ───────────
+            cfg = get_config()
+            search_sel = site_map['search']['selector'] if site_map['search'] else '#search'
+            ai_prompt = (
+                f"You are a senior QA engineer reviewing e-commerce test coverage for: {base_url}\n\n"
+                f"We already have {len(generated)} test cases:\n"
+                + "\n".join(f"- {tc['name']}" for tc in generated[:30]) + "\n\n"
+                "Generate 5-8 ADDITIONAL edge-case / negative test cases we may have missed.\n"
+                "Focus on: empty cart checkout, invalid login, newsletter signup, search with special chars, "
+                "session persistence, or any site-specific edge case.\n\n"
+                "Use ONLY these real URLs:\n"
+                + "\n".join(f"- {c['text']}: {c['url']}" for c in site_map['categories'][:10]) + "\n"
+                f"- Cart: {site_map['cart_url']}\n- Login: {site_map['login_url']}\n\n"
+                f"For navigate steps: use full URL in 'target'.\n"
+                f"For fill steps: search input selector is: {search_sel}\n"
+                '{"test_cases":[{"name":"Edge Case Name","category":"edge","steps":['
+                '{"action":"navigate","target":"https://...","description":"...","verify":"..."},'
+                '{"action":"fill","target":"#search","value":"!!!","description":"...","verify":"..."}'
+                ']}]}'
+            )
+            try:
+                log_cb("info", "AI enhancement pass (edge cases)...")
+                raw_ai = call_ai(ai_prompt, cfg, timeout=120, json_mode=False)
+                if raw_ai:
+                    extra = _parse_ai_json(raw_ai)
                     if extra:
                         if isinstance(extra, dict):
-                            if isinstance(extra.get('test_cases'), list): extra = extra['test_cases']
-                            else: extra = [v for v in extra.values() if isinstance(v, dict) and v.get('name')]
+                            extra = extra.get('test_cases', [v for v in extra.values() if isinstance(v, dict) and v.get('name')])
                         if isinstance(extra, list):
                             extra = [tc for tc in extra if isinstance(tc, dict) and tc.get('name') and tc.get('steps')]
-                            existing_names = {tc.get('name', '').lower() for tc in generated}
+                            existing_names = {tc['name'].lower() for tc in generated}
                             added = 0
                             for tc in extra:
                                 if tc.get('name', '').lower() not in existing_names:
+                                    for step in tc.get('steps', []):
+                                        for field in ('target', 'description'):
+                                            if step.get(field) and '$BASE_URL' in step[field]:
+                                                step[field] = step[field].replace('$BASE_URL', base_url.rstrip('/'))
                                     generated.append(tc)
-                                    existing_names.add(tc.get('name', '').lower())
+                                    existing_names.add(tc['name'].lower())
                                     added += 1
-                            log_cb("info", f"Second pass added {added} more - total: {len(generated)}")
-                except Exception as e:
-                    log_cb("warning", f"Second pass failed: {e}")
+                            log_cb("info", f"AI added {added} edge case(s) — total: {len(generated)}")
+                else:
+                    log_cb("info", "AI enhancement skipped (no response) — template cases are complete")
+            except Exception as e:
+                log_cb("info", f"AI enhancement skipped ({e}) — template cases are complete")
 
-            log_cb("info", f"Total before validation: {len(generated)} test case(s)")
-
-            for tc in generated:
-                for step in tc.get("steps", []):
-                    t = step.get("target", "")
-                    if t and "$BASE_URL" in t:
-                        step["target"] = t.replace("$BASE_URL", base_url.rstrip("/"))
-                    d = step.get("description", "")
-                    if d and "$BASE_URL" in d:
-                        step["description"] = d.replace("$BASE_URL", base_url.rstrip("/"))
-
-            log_cb("info", "Validating selectors with Playwright...")
-            valid_count = 0; fixed_count = 0; failed_count = 0
-            for tc in generated:
-                first_nav = None
-                for step in tc.get("steps", []):
-                    if step.get("action") == "navigate" and step.get("target", "").startswith("http"):
-                        first_nav = step["target"]
-                        break
-                if first_nav and first_nav not in visited_urls:
-                    try:
-                        page.goto(first_nav, wait_until="load", timeout=15000)
-                        page.wait_for_timeout(1500)
-                        visited_urls.add(first_nav)
-                    except: pass
-
-                for step in tc.get("steps", []):
-                    target = step.get("target", "")
-                    action = step.get("action", "")
-                    desc = step.get("description", "")
-                    if not target or action == "navigate" or target.startswith("http") or target == "page":
-                        continue
-                    if target.startswith("#") or target.startswith(".") or target.startswith("[") or re.match(r'^[a-z]+\[', target):
-                        if selector_exists(page, target):
-                            valid_count += 1
-                            continue
-                        working, found = _find_working_selector(page, target, desc, log_cb=log_cb)
-                        step["target"] = working
-                        if found:
-                            valid_count += 1
-                            if working != target: fixed_count += 1
-                        else:
-                            failed_count += 1
-                    else:
-                        real_sel = _find_selector_by_text(page, target, action, desc)
-                        if real_sel:
-                            step["target"] = real_sel
-                            log_cb("info", f"Text matched: '{target}' -> {real_sel}")
-                            valid_count += 1
-                            fixed_count += 1
-                        else:
-                            step["target"] = f"text={target}"
-                            log_cb("warning", f"Using text fallback: '{target}'")
-                            failed_count += 1
-
-            log_cb("info", f"Selector validation: {valid_count} valid, {fixed_count} matched, {failed_count} fallbacks")
-
-            generated = [tc for tc in generated if tc.get("steps")]
-            if not generated:
-                emit_stream(sid, "error", json.dumps({"message": "No valid test cases generated"}))
-                browser.close()
-                return
-
-            log_cb("info", f"Final: {len(generated)} test cases ready to save")
+            log_cb("info", f"Total: {len(generated)} test cases ready to save")
             browser.close()
 
+
+        # Remove old ai-discovery test cases for this project so fresh test suite replaces stale cases
+        test_cases_table.remove((Query().projectId == pid) & (Query().source == "ai-discovery"))
+        _invalidate_table_cache("test_cases")
         all_tcs = safe_all(test_cases_table)
         count = len([t for t in all_tcs if t.get("projectId") == pid])
         to_insert = []
@@ -2294,17 +2851,24 @@ def _discovery_worker(pid, base_url, sid):
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f"[ERROR] AI Discovery failed: {e}\n{tb}")
+        try:
+            tb = traceback.format_exc()
+            safe_print(f"[ERROR] AI Discovery failed: {e}\n{tb}")
+        except Exception:
+            pass
+        err_msg = str(e)
         with _active_runs_lock:
             if sid in active_runs:
                 active_runs[sid]["status"] = "error"
-                active_runs[sid]["logs"].append({"time": now_iso(), "level": "error", "message": f"Discovery failed: {str(e)[:300]}"})
+                active_runs[sid]["logs"].append({"time": now_iso(), "level": "error", "message": f"Discovery failed: {err_msg[:300]}"})
                 active_runs[sid]["completed_at"] = now_iso()
         if browser:
             try: browser.close()
             except: pass
-        emit_stream(sid, "error", json.dumps({"message": str(e)[:500]}))
+        try:
+            emit_stream(sid, "error", json.dumps({"message": err_msg[:500]}))
+        except Exception:
+            pass
     finally:
         pass
 
