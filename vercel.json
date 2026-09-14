@@ -1,0 +1,18 @@
+{
+  "builds": [
+    {
+      "src": "smart_tester.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "smart_tester.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "ui/$1"
+    }
+  ]
+}
