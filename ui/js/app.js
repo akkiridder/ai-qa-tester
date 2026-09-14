@@ -759,7 +759,7 @@ const Workspace = {
 
     _connectSSE(runId) {
         if (this._sseSource) this._sseSource.close();
-        const src = new EventSource(`/api/run/stream/${runId}`);
+        const src = new EventSource(Api.withKey(`/api/run/stream/${runId}`));
         this._sseSource = src;
         src.addEventListener('log', (e) => {
             try { const ev = JSON.parse(e.data); this._appendTerminal(ev.text); } catch {}
@@ -1126,7 +1126,7 @@ Format 2: [{"test_case_id":"TC001","feature":"Login","description":"Verify login
     },
 
     _attachDiscoveryStream(streamId, statusEl) {
-        const src = new EventSource(`/api/run/stream/${streamId}`);
+        const src = new EventSource(Api.withKey(`/api/run/stream/${streamId}`));
         let alive = true;
 
         src.addEventListener('progress', (ev) => {
@@ -1594,15 +1594,15 @@ const Config = {
             const provider = data.ai_provider || 'ollama';
             const currentModel = data.ollama_model || 'qwen2.5-coder:3b';
             const cloudUrl = data.cloud_base_url || '';
-            const cloudKey = data.cloud_api_key || '';
+            const cloudKeySet = !!data.cloud_api_key_set;
             const cloudModel = data.cloud_model || '';
 
             // Fetch ollama status + models in parallel
             let ollamaStatus = false, models = [];
             try {
                 const [statusRes, modelsRes] = await Promise.all([
-                    fetch('/api/ollama-status').then(r => r.json()),
-                    fetch('/api/ollama-models').then(r => r.json()),
+                    Api.afetch('/api/ollama-status'),
+                    Api.afetch('/api/ollama-models'),
                 ]);
                 ollamaStatus = statusRes.data?.connected || false;
                 models = modelsRes.data?.models || [];
@@ -1673,8 +1673,8 @@ const Config = {
                             <input class="form-input" id="cfg-cloud-url" type="password" value="${esc(cloudUrl)}" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" oncopy="return false" oncut="return false" oncontextmenu="return false" ondrag="return false" ondragstart="return false" oninput="Config._debounceCloudTest()" style="-webkit-user-select:none;user-select:none">
                         </div>
                         <div class="form-group">
-                            <label class="form-label">API Key</label>
-                            <input class="form-input" id="cfg-cloud-key" type="password" value="${esc(cloudKey)}" placeholder="nvapi-..." oninput="Config._debounceCloudTest()">
+                            <label class="form-label">API Key ${cloudKeySet ? '<span class="cfg-status-badge ok">saved</span>' : ''}</label>
+                            <input class="form-input" id="cfg-cloud-key" type="password" value="" placeholder="${cloudKeySet ? '•••••••• (saved — leave blank to keep)' : 'nvapi-...'}" autocomplete="new-password" oninput="Config._debounceCloudTest()">
                         </div>
                         <div class="form-group">
                             <label class="form-label">Model</label>
@@ -1719,6 +1719,28 @@ const Config = {
                         </div>
                     </div>
                 </div>
+
+                <!-- Access Key Card -->
+                <div class="cfg-card">
+                    <div class="cfg-card-header">
+                        <span class="cfg-card-icon">🔑</span>
+                        <span class="cfg-card-title">Access Key</span>
+                        <div class="cfg-card-status" id="cfg-access-status">${Api.getKey() ? '<span class="cfg-status-dot cfg-status-ok"></span><span class="cfg-status-text cfg-status-ok">Set</span>' : '<span class="cfg-status-dot cfg-status-err"></span><span class="cfg-status-text cfg-status-err">Not set</span>'}</div>
+                    </div>
+                    <div class="cfg-card-body">
+                        <div class="form-group">
+                            <label class="form-label">X-API-Key (browser only)</label>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <input class="form-input" id="cfg-access-key" type="password" style="flex:1" placeholder="Paste server API key" autocomplete="new-password">
+                                <button class="btn btn-sm" onclick="Config.saveAccessKey()">Save</button>
+                                <button class="btn btn-sm btn-ghost" onclick="Config.clearAccessKey()">Clear</button>
+                            </div>
+                        </div>
+                        <div class="cfg-hint">
+                            Required when the server has <code>API_KEY</code> set (e.g. deployed). Stored in this browser only — never sent anywhere except your server.
+                        </div>
+                    </div>
+                </div>
             </div>`;
 
             this._onProviderChange();
@@ -1757,8 +1779,7 @@ const Config = {
         }
         if (statusEl) statusEl.innerHTML = '<span class="cfg-status-dot" style="background:#FDCB6E"></span><span class="cfg-status-text" style="color:#FDCB6E">Testing...</span>';
         try {
-            const resp = await fetch(`/api/cloud-test?base_url=${encodeURIComponent(url)}&api_key=${encodeURIComponent(key)}`);
-            const json = await resp.json();
+            const json = await Api.afetch(Api.withKey(`/api/cloud-test?base_url=${encodeURIComponent(url)}&api_key=${encodeURIComponent(key)}`));
             if (json.data?.connected) {
                 if (statusEl) statusEl.innerHTML = '<span class="cfg-status-dot cfg-status-ok"></span><span class="cfg-status-text cfg-status-ok">Connected</span>';
                 this.fetchCloudModels();
@@ -1780,8 +1801,7 @@ const Config = {
         if (btn) btn.disabled = true;
         if (statusEl) statusEl.innerHTML = '<span class="cfg-status-dot" style="background:#FDCB6E"></span><span class="cfg-status-text" style="color:#FDCB6E">Fetching models...</span>';
         try {
-            const resp = await fetch(`/api/cloud-models?base_url=${encodeURIComponent(url)}&api_key=${encodeURIComponent(key)}`);
-            const json = await resp.json();
+            const json = await Api.afetch(Api.withKey(`/api/cloud-models?base_url=${encodeURIComponent(url)}&api_key=${encodeURIComponent(key)}`));
             if (json.success && json.data?.models?.length > 0) {
                 const models = json.data.models;
                 const currentVal = select?.value || '';
@@ -1803,6 +1823,25 @@ const Config = {
         if (btn) btn.disabled = false;
     },
 
+    saveAccessKey() {
+        const v = document.getElementById('cfg-access-key')?.value.trim() || '';
+        if (!v) { toast('Enter a key first', 'warning'); return; }
+        Api.setKey(v);
+        document.getElementById('cfg-access-key').value = '';
+        const st = document.getElementById('cfg-access-status');
+        if (st) st.innerHTML = '<span class="cfg-status-dot cfg-status-ok"></span><span class="cfg-status-text cfg-status-ok">Set</span>';
+        toast('Access key saved in this browser', 'success');
+    },
+
+    clearAccessKey() {
+        Api.setKey('');
+        const inp = document.getElementById('cfg-access-key');
+        if (inp) inp.value = '';
+        const st = document.getElementById('cfg-access-status');
+        if (st) st.innerHTML = '<span class="cfg-status-dot cfg-status-err"></span><span class="cfg-status-text cfg-status-err">Not set</span>';
+        toast('Access key cleared', 'success');
+    },
+
     async save() {
         const provider = document.getElementById('cfg-provider')?.value || 'ollama';
         const url = document.getElementById('cfg-url')?.value || '';
@@ -1814,7 +1853,8 @@ const Config = {
             const payload = { ai_provider: provider, ollama_base_url: url, ollama_model: model };
             if (provider === 'cloud') {
                 payload.cloud_base_url = cloudUrl;
-                payload.cloud_api_key = cloudKey;
+                // Send key ONLY if user typed a new one — blank keeps the saved key.
+                if (cloudKey.trim()) payload.cloud_api_key = cloudKey.trim();
                 payload.cloud_model = cloudModel;
             }
             await Api.saveConfig(payload);
@@ -2104,7 +2144,7 @@ const QueueStatus = {
 
     _openStream() {
         if (this._sse) try { this._sse.close(); } catch {}
-        this._sse = new EventSource(`/api/queue/stream/${this._queueId}`);
+        this._sse = new EventSource(Api.withKey(`/api/queue/stream/${this._queueId}`));
         this._sse.onmessage = (ev) => {
             try { this._onEvent(JSON.parse(ev.data)); } catch {}
         };
@@ -2229,7 +2269,7 @@ const QueueStatus = {
         this._runId = runId;
         this._runTestName = testName || '';
         this._showRunTerminal();
-        const src = new EventSource(`/api/run/stream/${runId}`);
+        const src = new EventSource(Api.withKey(`/api/run/stream/${runId}`));
         this._runSse = src;
         src.addEventListener('log', (e) => {
             try { const ev = JSON.parse(e.data); if (ev.text) this._appendQueueTerm(ev.text); } catch {}

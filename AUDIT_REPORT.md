@@ -35,7 +35,7 @@
 ### IS-0001 — API Key Exposed in `config.json` [CRITICAL]
 - **Severity:** Critical | **Confidence:** 100%
 - **File:** `config.json` (line 7)
-- **Problem:** `cloud_api_key` contains the real NVIDIA API key (`nvapi-nD...d5B3`). While `config.json` IS in `.gitignore`, it was previously committed to git before `.gitignore` was updated. The key may exist in git history.
+- **Problem:** `cloud_api_key` contained a real NVIDIA API key (`nvapi-...` — redacted). While `config.json` IS in `.gitignore`, it was previously committed to git before `.gitignore` was updated. The key may exist in git history.
 - **Root Cause:** API key was written to config.json before .gitignore entry was added.
 - **Security Impact:** API key could be extracted from git history by anyone with repo access.
 - **Fix:** Rotate the NVIDIA API key immediately. Add `config.json` to `.gitignore` (already done). Consider using `git filter-branch` or BFG to scrub git history.

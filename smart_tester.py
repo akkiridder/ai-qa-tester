@@ -162,6 +162,18 @@ CONFIG_KEYS = ("ai_provider", "ollama_base_url", "ollama_model", "anthropic_api_
 SECRET_KEYS = ("cloud_api_key", "anthropic_api_key")
 DEFAULT_CONFIG = {"ai_provider":"ollama","ollama_base_url":"http://localhost:11434","ollama_model":"qwen2.5-coder:3b"}
 
+# Secrets are NEVER committed: load local .env (gitignored) so API_KEY /
+# CLOUD_API_KEY / ANTHROPIC_API_KEY work without touching config files.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    pass
+
+def _env_secret(name):
+    v = (os.environ.get(name, "") or "").strip().strip('"').strip("'")
+    return v
+
 def _read_config_file():
     if not CONFIG_FILE.exists():
         return {}
@@ -266,11 +278,17 @@ def get_config():
         safe_insert(config_table, merged)
         return dict(merged)
     result = {k: v for k, v in dict(cfg[0]).items() if k in CONFIG_KEYS}
-    # Secrets never live in the DB — overlay them from the (gitignored) config file
+    # Secrets never live in the DB — overlay them from the (gitignored) config
+    # file first, then OS env vars (highest priority, e.g. Vercel dashboard).
     file_cfg = _read_config_file()
     for k in SECRET_KEYS:
         if file_cfg.get(k):
             result[k] = file_cfg[k]
+    env_map = {"cloud_api_key": "CLOUD_API_KEY", "anthropic_api_key": "ANTHROPIC_API_KEY"}
+    for k in SECRET_KEYS:
+        env_val = _env_secret(env_map[k])
+        if env_val:
+            result[k] = env_val
     return result
 
 def save_config(data):
@@ -473,19 +491,26 @@ def cleanup_test_artifacts():
 
 @app.before_request
 def check_api_key():
+    # Auth disabled until API_KEY is set (local dev convenience).
     if not API_KEY:
         return None
-    if request.method in ("GET", "HEAD", "OPTIONS"):
+    # Browser preflight + static UI are always public.
+    if request.method == "OPTIONS":
         return None
-    if request.path.endswith("/stream") or "/stream/" in request.path:
+    if not request.path.startswith("/api/"):
         return None
+    # Localhost is trusted (same-machine dev loop).
     addr = (request.remote_addr or "").strip()
     if addr in LOCAL_ADDRS or addr.startswith("127."):
         return None
-    key = request.headers.get("X-API-Key") or request.args.get("api_key")
-    if key == API_KEY:
+    # Header is primary; ?access_key= exists for EventSource URLs
+    # (browsers cannot set custom headers on SSE connections).
+    key = request.headers.get("X-API-Key") or request.args.get("access_key")
+    if key and key == API_KEY:
         return None
-    return err("Unauthorized — set X-API-Key header", 401)
+    resp = err("Unauthorized — set X-API-Key header", 401)
+    resp[0].headers["WWW-Authenticate"] = 'ApiKey realm="ai-qa-tester"'
+    return resp
 
 @app.after_request
 def add_security_headers(response):
@@ -3267,18 +3292,30 @@ def api_run_result(rid):
 @app.route("/api/config")
 def api_get_config():
     cfg = get_config()
-    safe_cfg = {k:v for k,v in cfg.items() if k!="anthropic_api_key" or not v}
-    if safe_cfg.get("cloud_api_key"):
-        key = safe_cfg["cloud_api_key"]
-        safe_cfg["cloud_api_key"] = key[:6] + "..." + key[-4:] if len(key) > 10 else "***"
+    # NEVER expose secret values (not even masked — prefix/suffix leaks key info).
+    # The UI only needs to know whether a key is configured.
+    safe_cfg = {k: v for k, v in cfg.items() if k not in SECRET_KEYS}
+    safe_cfg["cloud_api_key_set"] = bool(cfg.get("cloud_api_key"))
+    safe_cfg["anthropic_api_key_set"] = bool(cfg.get("anthropic_api_key"))
     return ok(safe_cfg)
+
+def _looks_masked_or_blank(v):
+    if not v or not str(v).strip():
+        return True
+    s = str(v)
+    return "..." in s or "***" in s
 
 @app.route("/api/config", methods=["POST"])
 @require_json
 def api_save_config():
     data=request.json; current=get_config()
-    for k in ("ai_provider","ollama_base_url","ollama_model","anthropic_api_key","cloud_base_url","cloud_api_key","cloud_model"):
+    for k in ("ai_provider","ollama_base_url","ollama_model","cloud_base_url","cloud_model"):
         if k in data: current[k]=data[k]
+    # Secrets: only overwrite when a real new value is submitted.
+    # Blank / masked values must NEVER wipe the stored key.
+    for k in SECRET_KEYS:
+        if k in data and not _looks_masked_or_blank(data[k]):
+            current[k]=data[k]
     save_config(current); return ok({"status":"saved"})
 
 @app.route("/api/ollama-status")
@@ -3366,7 +3403,9 @@ if __name__=="__main__":
     print(f"  Ollama: {'Connected' if ollama_available() else 'Not running'}")
     print(f"  Model: {cfg.get('ollama_model', 'qwen2.5-coder:3b')} @ {cfg.get('ollama_base_url', 'http://localhost:11434')}")
     if API_KEY:
-        print("  API_KEY: enabled (localhost requests exempt)")
+        print("  API_KEY: enabled (all /api/* locked, localhost exempt)")
+    else:
+        print("  WARNING: API_KEY is empty — API auth is DISABLED. Set API_KEY env var to lock /api/*.")
     print("="*50)
 
     # Start auto-resume in background

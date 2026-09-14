@@ -1,14 +1,40 @@
 const API_BASE = '/api';
 
 const Api = {
+    // Access key for X-API-Key header auth (stored in browser only, never in repo).
+    getKey() { try { return localStorage.getItem('aiqa_api_key') || ''; } catch { return ''; } },
+    setKey(k) { try { k ? localStorage.setItem('aiqa_api_key', k) : localStorage.removeItem('aiqa_api_key'); } catch {} },
+    headers(extra = {}) {
+        const h = { 'Content-Type': 'application/json', ...(extra || {}) };
+        const k = this.getKey();
+        if (k) h['X-API-Key'] = k;
+        return h;
+    },
+    // Query-param variant for EventSource URLs (browsers can't set headers on SSE).
+    withKey(url) {
+        const k = this.getKey();
+        if (!k) return url;
+        return url + (url.includes('?') ? '&' : '?') + 'access_key=' + encodeURIComponent(k);
+    },
+    // Raw fetch with auth headers (for non-/api-wrapper GETs).
+    async afetch(url, options = {}) {
+        const { headers, ...rest } = options;
+        const response = await fetch(url, { ...rest, headers: this.headers(headers) });
+        return response.json();
+    },
     async request(endpoint, options = {}) {
         try {
+            const { headers, ...rest } = options;
             const response = await fetch(`${API_BASE}/${endpoint}`, {
-                headers: { 'Content-Type': 'application/json' },
-                ...options,
+                ...rest,
+                headers: this.headers(headers),
             });
             const data = await response.json();
             if (!data.success) {
+                if (response.status === 401) {
+                    toast('Unauthorized — set your Access Key in Settings', 'error');
+                    App.navigate('settings');
+                }
                 throw new Error(data.error || 'API request failed');
             }
             return data;

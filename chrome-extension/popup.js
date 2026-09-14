@@ -4,9 +4,17 @@ const serverUrl = () => $('#server-url').value.replace(/\/+$/, '');
 let currentSteps = [];
 let projects = [];
 
+const authHeaders = async (extra = {}) => {
+    const stored = await chrome.storage.local.get(['accessKey']);
+    const h = { ...extra };
+    if (stored.accessKey) h['X-API-Key'] = stored.accessKey;
+    return h;
+};
+
 document.addEventListener('DOMContentLoaded', async () => {
-    const stored = await chrome.storage.local.get(['serverUrl']);
+    const stored = await chrome.storage.local.get(['serverUrl', 'accessKey']);
     if (stored.serverUrl) $('#server-url').value = stored.serverUrl;
+    if (stored.accessKey) $('#access-key').value = stored.accessKey;
 
     chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
         if (state && state.active) {
@@ -30,6 +38,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     $('#server-url').addEventListener('change', () => {
         chrome.storage.local.set({ serverUrl: $('#server-url').value });
+    });
+
+    $('#access-key').addEventListener('change', () => {
+        chrome.storage.local.set({ accessKey: $('#access-key').value.trim() });
     });
 });
 
@@ -141,7 +153,7 @@ function removeDuplicates() {
 
 async function loadProjects() {
     try {
-        const resp = await fetch(`${serverUrl()}/api/projects`);
+        const resp = await fetch(`${serverUrl()}/api/projects`, { headers: await authHeaders() });
         const data = await resp.json();
         if (data.success && Array.isArray(data.data)) {
             projects = data.data;
@@ -163,7 +175,7 @@ async function createProject() {
     try {
         const resp = await fetch(`${serverUrl()}/api/projects`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: await authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ name, url: url }),
         });
         const data = await resp.json();
@@ -200,7 +212,7 @@ async function saveToProject() {
     try {
         const resp = await fetch(`${serverUrl()}/api/projects/${projectId}/test-cases`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: await authHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ name: name, steps }),
         });
         const data = await resp.json();

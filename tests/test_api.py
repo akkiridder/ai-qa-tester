@@ -194,21 +194,27 @@ class TestConfig:
         assert data['success'] == True
 
     def test_save_config_preserves_masked_key(self, client):
-        """Test that saving config with masked key preserves the real key."""
+        """Test that secret values are never exposed and blanks never wipe the key."""
         # Save a real key first
         client.post('/api/config',
-            data=json.dumps({'cloud_api_key': 'nvapi-real-key-12345'}),
+            data=json.dumps({'cloud_api_key': 'nvapi-test-dummy-key-12345'}),
             content_type='application/json')
-        # Save again with masked value
+        # GET must NOT expose any key material — only a boolean flag
+        response = client.get('/api/config')
+        data = json.loads(response.data)
+        assert 'cloud_api_key' not in data['data']
+        assert 'anthropic_api_key' not in data['data']
+        assert data['data'].get('cloud_api_key_set') is True
+        # Save again with blank/masked value — stored key must survive
+        client.post('/api/config',
+            data=json.dumps({'cloud_api_key': ''}),
+            content_type='application/json')
         client.post('/api/config',
             data=json.dumps({'cloud_api_key': 'nvapi-...xxx'}),
             content_type='application/json')
-        # Verify the real key is preserved
         response = client.get('/api/config')
         data = json.loads(response.data)
-        # Key should be masked in output, but should not be 'nvapi-...xxx'
-        key = data['data'].get('cloud_api_key', '')
-        assert '...' in key or key == ''  # masked or empty, not the masked input
+        assert data['data'].get('cloud_api_key_set') is True
 
 class TestTestCaseUpdateDelete:
     def test_update_test_case(self, client):
