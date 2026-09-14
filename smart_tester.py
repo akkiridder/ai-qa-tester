@@ -37,16 +37,21 @@ import requests
 from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).parent.resolve()
-DATA_DIR = BASE_DIR / "data"
+# Vercel serverless filesystem is read-only except /tmp — keep writable data there
+if os.environ.get("VERCEL"):
+    DATA_DIR = Path("/tmp") / "ai-qa-data"
+else:
+    DATA_DIR = BASE_DIR / "data"
 TEST_PLANS_DIR = DATA_DIR / "test-plans"
 SCREENSHOTS_DIR = DATA_DIR / "screenshots"
 UI_DIR = BASE_DIR / "ui"
 CONFIG_FILE = BASE_DIR / "config.json"
 
-DATA_DIR.mkdir(exist_ok=True)
-TEST_PLANS_DIR.mkdir(exist_ok=True)
-SCREENSHOTS_DIR.mkdir(exist_ok=True)
-UI_DIR.mkdir(exist_ok=True)
+for _d in (DATA_DIR, TEST_PLANS_DIR, SCREENSHOTS_DIR, UI_DIR):
+    try:
+        _d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
 DB_FILE = DATA_DIR / "database.json"
 
@@ -172,7 +177,10 @@ def _write_config_file(data):
         return
     existing = _read_config_file()
     existing.update(payload)
-    CONFIG_FILE.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    try:
+        CONFIG_FILE.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 def call_ai(prompt, cfg=None, timeout=300, json_mode=False, force_provider=None, on_stats=None):
     """Call AI provider (Ollama or Cloud API). Returns response text or None."""

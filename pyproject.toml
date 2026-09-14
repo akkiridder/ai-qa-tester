@@ -9,6 +9,7 @@ dependencies = [
     "flask-limiter>=3.9.0",
     "requests>=2.34.2",
     "tinydb>=4.8.2",
+    "playwright>=1.60.0",
     "waitress>=3.0.2",
 ]
 
