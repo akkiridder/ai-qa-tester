@@ -5,15 +5,20 @@ let currentSteps = [];
 let projects = [];
 
 const authHeaders = async (extra = {}) => {
-    const stored = await chrome.storage.local.get(['accessKey']);
+    const stored = await chrome.storage.local.get(['accessId', 'accessKey']);
     const h = { ...extra };
-    if (stored.accessKey) h['X-API-Key'] = stored.accessKey;
+    if (stored.accessId && stored.accessKey) {
+        h['Authorization'] = 'Basic ' + btoa(stored.accessId + ':' + stored.accessKey);
+    } else if (stored.accessKey) {
+        h['X-API-Key'] = stored.accessKey;
+    }
     return h;
 };
 
 document.addEventListener('DOMContentLoaded', async () => {
-    const stored = await chrome.storage.local.get(['serverUrl', 'accessKey']);
+    const stored = await chrome.storage.local.get(['serverUrl', 'accessId', 'accessKey']);
     if (stored.serverUrl) $('#server-url').value = stored.serverUrl;
+    if (stored.accessId) $('#access-id').value = stored.accessId;
     if (stored.accessKey) $('#access-key').value = stored.accessKey;
 
     chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
@@ -40,8 +45,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         chrome.storage.local.set({ serverUrl: $('#server-url').value });
     });
 
+    $('#access-id').addEventListener('change', () => {
+        chrome.storage.local.set({ accessId: $('#access-id').value.trim() });
+    });
+
     $('#access-key').addEventListener('change', () => {
-        chrome.storage.local.set({ accessKey: $('#access-key').value.trim() });
+        chrome.storage.local.set({ accessKey: $('#access-key').value });
     });
 });
 

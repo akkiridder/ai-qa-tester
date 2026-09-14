@@ -54,6 +54,51 @@ def client():
     # Cleanup
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
+class TestBasicAuth:
+    """HTTP Basic Auth (ID + password) + X-API-Key header enforcement."""
+
+    @pytest.fixture
+    def authed(self, monkeypatch):
+        monkeypatch.setattr(smart_tester, "API_KEY", "")
+        monkeypatch.setattr(smart_tester, "AUTH_USER", "Akki")
+        monkeypatch.setattr(smart_tester, "AUTH_PASS", "Akki@123")
+        import base64
+        good = "Basic " + base64.b64encode(b"Akki:Akki@123").decode()
+        bad = "Basic " + base64.b64encode(b"Akki:wrong").decode()
+        return {"good": good, "bad": bad}
+
+    def _remote(self, client, path, headers=None):
+        return client.get(path, headers=headers or {},
+                           environ_overrides={"REMOTE_ADDR": "8.8.8.8"})
+
+    def test_remote_no_creds_401(self, client, authed):
+        r = self._remote(client, "/api/projects")
+        assert r.status_code == 401
+        assert r.headers.get("WWW-Authenticate", "").startswith("Basic")
+
+    def test_remote_ui_locked(self, client, authed):
+        r = self._remote(client, "/")
+        assert r.status_code == 401
+
+    def test_remote_wrong_password_401(self, client, authed):
+        r = self._remote(client, "/api/projects",
+                         {"Authorization": authed["bad"]})
+        assert r.status_code == 401
+
+    def test_remote_basic_ok(self, client, authed):
+        r = self._remote(client, "/api/projects",
+                         {"Authorization": authed["good"]})
+        assert r.status_code == 200
+
+    def test_remote_query_creds_ok(self, client, authed):
+        r = self._remote(client, "/api/projects?access_user=Akki&access_pass=Akki@123")
+        assert r.status_code == 200
+
+    def test_localhost_bypass(self, client, authed):
+        r = client.get("/api/projects",
+                       environ_overrides={"REMOTE_ADDR": "127.0.0.1"})
+        assert r.status_code == 200
+
 class TestDashboard:
     def test_dashboard_empty(self, client):
         """Test dashboard with no data."""

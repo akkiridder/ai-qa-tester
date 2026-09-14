@@ -334,7 +334,26 @@ ACTIVE_STATE_FILE = DATA_DIR / "active_state.json"
 _state_save_lock = threading.Lock()
 _last_state_save = 0.0
 API_KEY = os.environ.get("API_KEY", "").strip()
+# HTTP Basic Auth credentials — ALWAYS via env (.env locally, dashboard on
+# hosting). NEVER hardcode or commit these; the repo must stay secret-free.
+AUTH_USER = os.environ.get("AUTH_USER", "").strip()
+AUTH_PASS = os.environ.get("AUTH_PASS", "")
 LOCAL_ADDRS = {"127.0.0.1", "::1"}
+
+def _basic_auth_ok():
+    """Validate HTTP `Authorization: Basic base64(id:pass)` header."""
+    if not (AUTH_USER and AUTH_PASS):
+        return False
+    auth = request.headers.get("Authorization", "")
+    if not auth[:6].lower() == "basic ":
+        return False
+    try:
+        import base64
+        decoded = base64.b64decode(auth[6:].strip()).decode("utf-8", "replace")
+    except Exception:
+        return False
+    user, sep, pwd = decoded.partition(":")
+    return bool(sep) and user == AUTH_USER and pwd == AUTH_PASS
 TEST_ARTIFACT_NAMES = {"Seed Test Project", "API Test Project", "API Test Project v2"}
 TEST_ARTIFACT_URLS = {"https://example.com", "http://example.com"}
 RESULT_LIST_FIELDS = (
@@ -491,25 +510,36 @@ def cleanup_test_artifacts():
 
 @app.before_request
 def check_api_key():
-    # Auth disabled until API_KEY is set (local dev convenience).
-    if not API_KEY:
+    # Auth disabled until API_KEY or AUTH_USER/AUTH_PASS is set (local dev).
+    auth_on = bool(API_KEY) or bool(AUTH_USER and AUTH_PASS)
+    if not auth_on:
         return None
-    # Browser preflight + static UI are always public.
+    # Browser preflight is always public.
     if request.method == "OPTIONS":
         return None
-    if not request.path.startswith("/api/"):
-        return None
+    # NOTE: the whole site (UI + /api/*) is locked when auth is on, so the
+    # browser shows its native "sign in" popup on first open and then sends
+    # the credentials automatically with every request (API, SSE, assets).
     # Localhost is trusted (same-machine dev loop).
     addr = (request.remote_addr or "").strip()
     if addr in LOCAL_ADDRS or addr.startswith("127."):
         return None
-    # Header is primary; ?access_key= exists for EventSource URLs
-    # (browsers cannot set custom headers on SSE connections).
-    key = request.headers.get("X-API-Key") or request.args.get("access_key")
-    if key and key == API_KEY:
+    # 1) API key: X-API-Key header, or ?access_key= for EventSource URLs
+    #    (browsers cannot set custom headers on SSE connections).
+    if API_KEY:
+        key = request.headers.get("X-API-Key") or request.args.get("access_key")
+        if key and key == API_KEY:
+            return None
+    # 2) HTTP Basic: Authorization header, or ?access_user/&access_pass=
+    #    for EventSource URLs.
+    if _basic_auth_ok():
         return None
-    resp = err("Unauthorized — set X-API-Key header", 401)
-    resp[0].headers["WWW-Authenticate"] = 'ApiKey realm="ai-qa-tester"'
+    if AUTH_USER and AUTH_PASS:
+        qu, qp = request.args.get("access_user"), request.args.get("access_pass")
+        if qu == AUTH_USER and qp is not None and qp == AUTH_PASS:
+            return None
+    resp = err("Unauthorized — send X-API-Key header or Basic credentials", 401)
+    resp[0].headers["WWW-Authenticate"] = 'Basic realm="ai-qa-tester"'
     return resp
 
 @app.after_request
@@ -3402,10 +3432,13 @@ if __name__=="__main__":
     print(f"  Bind: {host}  (set HOST=0.0.0.0 for LAN access)")
     print(f"  Ollama: {'Connected' if ollama_available() else 'Not running'}")
     print(f"  Model: {cfg.get('ollama_model', 'qwen2.5-coder:3b')} @ {cfg.get('ollama_base_url', 'http://localhost:11434')}")
-    if API_KEY:
-        print("  API_KEY: enabled (all /api/* locked, localhost exempt)")
+    if API_KEY or (AUTH_USER and AUTH_PASS):
+        methods = []
+        if API_KEY: methods.append("X-API-Key")
+        if AUTH_USER and AUTH_PASS: methods.append(f"Basic (id={AUTH_USER})")
+        print(f"  Auth: enabled [{', '.join(methods)}] — all /api/* locked, localhost exempt")
     else:
-        print("  WARNING: API_KEY is empty — API auth is DISABLED. Set API_KEY env var to lock /api/*.")
+        print("  WARNING: no API_KEY / AUTH_USER+AUTH_PASS set — API auth is DISABLED.")
     print("="*50)
 
     # Start auto-resume in background

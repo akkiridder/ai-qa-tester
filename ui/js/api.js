@@ -1,20 +1,43 @@
 const API_BASE = '/api';
 
 const Api = {
-    // Access key for X-API-Key header auth (stored in browser only, never in repo).
+    // Auth credentials (stored in browser only, never in repo).
+    // Either an API key (X-API-Key header) or an ID + password (HTTP Basic).
     getKey() { try { return localStorage.getItem('aiqa_api_key') || ''; } catch { return ''; } },
     setKey(k) { try { k ? localStorage.setItem('aiqa_api_key', k) : localStorage.removeItem('aiqa_api_key'); } catch {} },
+    getUser() { try { return localStorage.getItem('aiqa_auth_user') || ''; } catch { return ''; } },
+    getPass() { try { return localStorage.getItem('aiqa_auth_pass') || ''; } catch { return ''; } },
+    setCreds(u, p) {
+        try {
+            u ? localStorage.setItem('aiqa_auth_user', u) : localStorage.removeItem('aiqa_auth_user');
+            p ? localStorage.setItem('aiqa_auth_pass', p) : localStorage.removeItem('aiqa_auth_pass');
+        } catch {}
+    },
+    clearAuth() { this.setKey(''); this.setCreds('', ''); },
+    hasAuth() { return !!(this.getKey() || (this.getUser() && this.getPass())); },
+    basicToken() {
+        const u = this.getUser(), p = this.getPass();
+        if (!u || !p) return '';
+        return 'Basic ' + btoa(u + ':' + p);
+    },
     headers(extra = {}) {
         const h = { 'Content-Type': 'application/json', ...(extra || {}) };
         const k = this.getKey();
         if (k) h['X-API-Key'] = k;
+        else {
+            const t = this.basicToken();
+            if (t) h['Authorization'] = t;
+        }
         return h;
     },
     // Query-param variant for EventSource URLs (browsers can't set headers on SSE).
     withKey(url) {
         const k = this.getKey();
-        if (!k) return url;
-        return url + (url.includes('?') ? '&' : '?') + 'access_key=' + encodeURIComponent(k);
+        const sep = url.includes('?') ? '&' : '?';
+        if (k) return url + sep + 'access_key=' + encodeURIComponent(k);
+        const u = this.getUser(), p = this.getPass();
+        if (u && p) return url + sep + 'access_user=' + encodeURIComponent(u) + '&access_pass=' + encodeURIComponent(p);
+        return url;
     },
     // Raw fetch with auth headers (for non-/api-wrapper GETs).
     async afetch(url, options = {}) {
@@ -32,8 +55,9 @@ const Api = {
             const data = await response.json();
             if (!data.success) {
                 if (response.status === 401) {
-                    toast('Unauthorized — set your Access Key in Settings', 'error');
-                    App.navigate('settings');
+                    // Don't auto-navigate: the browser's native sign-in popup
+                    // (Basic auth) may already be handling this inline.
+                    toast('Unauthorized — sign in (browser popup) or set Access Login in Settings', 'error');
                 }
                 throw new Error(data.error || 'API request failed');
             }

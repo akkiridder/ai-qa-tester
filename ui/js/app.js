@@ -1724,20 +1724,24 @@ const Config = {
                 <div class="cfg-card">
                     <div class="cfg-card-header">
                         <span class="cfg-card-icon">🔑</span>
-                        <span class="cfg-card-title">Access Key</span>
-                        <div class="cfg-card-status" id="cfg-access-status">${Api.getKey() ? '<span class="cfg-status-dot cfg-status-ok"></span><span class="cfg-status-text cfg-status-ok">Set</span>' : '<span class="cfg-status-dot cfg-status-err"></span><span class="cfg-status-text cfg-status-err">Not set</span>'}</div>
+                        <span class="cfg-card-title">Access Login</span>
+                        <div class="cfg-card-status" id="cfg-access-status">${Api.hasAuth() ? '<span class="cfg-status-dot cfg-status-ok"></span><span class="cfg-status-text cfg-status-ok">Set</span>' : '<span class="cfg-status-dot cfg-status-err"></span><span class="cfg-status-text cfg-status-err">Not set</span>'}</div>
                     </div>
                     <div class="cfg-card-body">
                         <div class="form-group">
-                            <label class="form-label">X-API-Key (browser only)</label>
+                            <label class="form-label">ID</label>
+                            <input class="form-input" id="cfg-access-id" type="text" value="${esc(Api.getUser())}" placeholder="Server login ID" autocomplete="username">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Password</label>
                             <div style="display:flex;gap:8px;align-items:center">
-                                <input class="form-input" id="cfg-access-key" type="password" style="flex:1" placeholder="Paste server API key" autocomplete="new-password">
+                                <input class="form-input" id="cfg-access-pass" type="password" style="flex:1" placeholder="Server password" autocomplete="current-password">
                                 <button class="btn btn-sm" onclick="Config.saveAccessKey()">Save</button>
                                 <button class="btn btn-sm btn-ghost" onclick="Config.clearAccessKey()">Clear</button>
                             </div>
                         </div>
                         <div class="cfg-hint">
-                            Required when the server has <code>API_KEY</code> set (e.g. deployed). Stored in this browser only — never sent anywhere except your server.
+                            Required when the server has login auth set (e.g. deployed). Sent as HTTP Basic header. Stored in this browser only — never in any file or repo.
                         </div>
                     </div>
                 </div>
@@ -1824,22 +1828,27 @@ const Config = {
     },
 
     saveAccessKey() {
-        const v = document.getElementById('cfg-access-key')?.value.trim() || '';
-        if (!v) { toast('Enter a key first', 'warning'); return; }
-        Api.setKey(v);
-        document.getElementById('cfg-access-key').value = '';
+        const u = document.getElementById('cfg-access-id')?.value.trim() || '';
+        const p = document.getElementById('cfg-access-pass')?.value || '';
+        if (!u || !p) { toast('Enter ID and password', 'warning'); return; }
+        Api.setCreds(u, p);
+        const passEl = document.getElementById('cfg-access-pass');
+        if (passEl) passEl.value = '';
         const st = document.getElementById('cfg-access-status');
         if (st) st.innerHTML = '<span class="cfg-status-dot cfg-status-ok"></span><span class="cfg-status-text cfg-status-ok">Set</span>';
-        toast('Access key saved in this browser', 'success');
+        toast('Access login saved in this browser', 'success');
+        this.load();
     },
 
     clearAccessKey() {
-        Api.setKey('');
-        const inp = document.getElementById('cfg-access-key');
-        if (inp) inp.value = '';
+        Api.clearAuth();
+        const idEl = document.getElementById('cfg-access-id');
+        const passEl = document.getElementById('cfg-access-pass');
+        if (idEl) idEl.value = '';
+        if (passEl) passEl.value = '';
         const st = document.getElementById('cfg-access-status');
         if (st) st.innerHTML = '<span class="cfg-status-dot cfg-status-err"></span><span class="cfg-status-text cfg-status-err">Not set</span>';
-        toast('Access key cleared', 'success');
+        toast('Access login cleared', 'success');
     },
 
     async save() {
