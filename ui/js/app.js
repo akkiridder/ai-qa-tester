@@ -1381,8 +1381,15 @@ const Results = {
         const container = document.getElementById('results-content');
         container.innerHTML = '<div class="empty-state-sm">Loading results...</div>';
         try {
-            const { data } = await Api.getTestResults();
-            this._raw = data || [];
+            const [resRes, projRes] = await Promise.all([Api.getTestResults(), Api.getProjects()]);
+            this._raw = resRes.data || [];
+            this._projectMap = {};
+            (projRes.data || []).forEach(p => { this._projectMap[p.id || p._id] = p.name; });
+            this._raw.forEach(r => {
+                if (!r.projectName && r.projectId && this._projectMap[r.projectId]) {
+                    r.projectName = this._projectMap[r.projectId];
+                }
+            });
             if (!this._raw.length) { container.innerHTML = '<div class="empty-state-sm">No test runs yet.</div>'; return; }
             this._restoreFilters();
             this._render();
@@ -1415,14 +1422,19 @@ const Results = {
         if (f.range !== 'all') {
             const key = _dateKey(r.created || r.createdAt);
             if (!key) return false;
-            const today = new Date(); today.setHours(0,0,0,0);
-            const dayMs = 86400000;
-            const rDate = new Date(key + 'T12:00:00Z');
-            const diffDays = Math.floor((today.getTime() - rDate.getTime()) / dayMs);
-            if (f.range === 'today' && diffDays !== 0) return false;
-            if (f.range === 'yesterday' && diffDays !== 1) return false;
-            if (f.range === '7d' && (diffDays < 0 || diffDays > 6)) return false;
-            if (f.range === '30d' && (diffDays < 0 || diffDays > 29)) return false;
+            const now = new Date();
+            const todayKey = now.toISOString().substring(0, 10);
+            const yesterdayDate = new Date(now.getTime() - 86400000);
+            const yesterdayKey = yesterdayDate.toISOString().substring(0, 10);
+            if (f.range === 'today' && key !== todayKey) return false;
+            if (f.range === 'yesterday' && key !== yesterdayKey) return false;
+            if (f.range === '7d' || f.range === '30d') {
+                const maxDays = f.range === '7d' ? 6 : 29;
+                const rDate = new Date(key + 'T12:00:00Z');
+                const todayDate = new Date(todayKey + 'T12:00:00Z');
+                const diffDays = Math.floor((todayDate.getTime() - rDate.getTime()) / 86400000);
+                if (diffDays < 0 || diffDays > maxDays) return false;
+            }
         }
         return true;
     },

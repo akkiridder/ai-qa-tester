@@ -312,7 +312,7 @@ LOCAL_ADDRS = {"127.0.0.1", "::1"}
 TEST_ARTIFACT_NAMES = {"Seed Test Project", "API Test Project", "API Test Project v2"}
 TEST_ARTIFACT_URLS = {"https://example.com", "http://example.com"}
 RESULT_LIST_FIELDS = (
-    "_id", "id", "projectId", "testCaseId", "testCaseName", "status", "mode", "device",
+    "_id", "id", "projectId", "projectName", "testCaseId", "testCaseName", "status", "mode", "device",
     "passed", "adapted", "failed", "blocked", "summary", "duration", "runner", "createdAt", "executedAt",
 )
 
@@ -1678,6 +1678,7 @@ def run_test_thread(tc_id, run_id, mode="standard", device="desktop"):
     result_data = {
         "_id": run_id, "id": run_id,
         "projectId": tc.get("projectId",""),
+        "projectName": project.get("name","") if project else "",
         "testCaseId": tc_id,
         "testCaseName": tc.get("name","Untitled"),
         "status": final_status,
@@ -1850,6 +1851,7 @@ def api_save_project_result(pid):
             data["_id"] = rid
             data["id"] = rid
             data["projectId"] = pid
+            data["projectName"] = p.get("name", "")
             data.setdefault("createdAt", now_iso())
             safe_insert(results_table, data)
             return ok(data)
