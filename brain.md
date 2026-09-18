@@ -736,3 +736,43 @@ AI Agent QA Tester — a Flask + vanilla JS web app that lets users:
   - Resilient Windows UTF-8 / Emoji Handling (Zero charmap crashes)
   - Seamless HTTP Basic Authentication Support across Requests and Playwright
 
+---
+
+## 2026-09-18 Session — GitHub Sync, Vercel Live Fix & Security Audit
+
+### 1. GitHub Repo `akkiridder/ai-qa-tester`
+- Local project pushed to GitHub. Local remote URL contained an embedded PAT (`ghp_...`) — **removed** via `git remote set-url origin https://github.com/akkiridder/ai-qa-tester.git` (token was only ever in local `.git/config`, never committed, never on GitHub).
+- Verified: no real keys/tokens exist in current tracked files, git history, or the live site's `/api/config`.
+
+### 2. Secrets Audit (All Clear)
+- **Live `/api/config`**: returns only `..._api_key_set: false` flags — no keys exposed.
+- **Tracked files** (`smart_tester.py`, `data/database.json`, etc.): no `nvapi-`, `sk-`, `ghp_`, `AIza` values.
+- **Full git history**: no `nvapi-` key with real characters (only redacted/comment mentions in docs).
+- **`.env` / `config.json`**: gitignored → never deploy to GitHub/Vercel.
+- ✅ **Recommendation given**: revoke the old `ghp_` PAT in GitHub settings as a precaution (it was visible in a terminal log).
+
+### 3. Root Cause of Vercel `500 FUNCTION_INVOCATION_FAILED` (CRITICAL)
+- GitHub `main` had 5 commits **ahead of local** whose "RESTORE: full smart_tester.py" commits actually **GUTTED the app** — `smart_tester.py` was reduced from 3465 lines to a **169-line stub** (no `app`, no routes).
+- `pyproject.toml` entrypoint = `smart_tester:app` → import failed (`app` missing) → **FUNCTION_INVOCATION_FAILED**.
+- Fix: force-pushed local complete `main` (`f9b8dcf`) back to GitHub, then applied the hardening fix below.
+
+### 4. Vercel Cold-Start Hardening (commit `12af46a`)
+- **Lazy Playwright import**: replaced module-level `from playwright.sync_api import sync_playwright` with `_playwright()` helper (imported only inside the test-run/worker functions).
+  - Module import time: ~1.92s → **~1.25s** — removes the main cold-start timeout risk on serverless (Vercel) invocations.
+  - Both `with sync_playwright() as p:` sites updated to `with _playwright()() as p:`.
+- **`vercel.json` created**: `functions.smart_tester.py` → `maxDuration: 60`, `memory: 1024`.
+- **Pytest**: **45/45 passing** after the change.
+
+### 5. Live Verification (`https://ai-qa-tester-kappa.vercel.app`)
+| Check | Result |
+|---|---|
+| `/` (frontend) | 200 |
+| `/api/health` | 200 — `{"db_ok":true,"status":"healthy","version":"2.5"}` |
+| `/api/dashboard` | 200 |
+| `/api/projects` | 200 — `[]` (Vercel uses fresh `/tmp` DB) |
+| `/js/app.js` (vanilla UI) | 200 |
+
+### Notes / Follow-ups
+- Vercel stores data in `/tmp/ai-qa-data` (ephemeral, read-only FS otherwise) driven by `VERCEL` env — **projects are NOT persisted** across cold starts. Local `data/database.json` stays authoritative. Optional future work: seed `/tmp` from committed DB on boot, or move to a persistent store.
+- Local & GitHub `main` are in sync at `12af46a`.
+
