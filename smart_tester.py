@@ -34,7 +34,14 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from tinydb import TinyDB, Query
 import requests
-from playwright.sync_api import sync_playwright
+
+# Playwright is imported lazily (inside functions) so the module loads fast
+# on cold-start serverless platforms (Vercel). Importing the sync API at
+# module level adds several seconds to function init and can exceed the
+# serverless invocation budget, causing FUNCTION_INVOCATION_FAILED.
+def _playwright():
+    from playwright.sync_api import sync_playwright
+    return sync_playwright
 
 BASE_DIR = Path(__file__).parent.resolve()
 # Vercel serverless filesystem is read-only except /tmp — keep writable data there
@@ -807,7 +814,7 @@ def run_test_case_with_ai(test_case, base_url, run_id, log_cb, mode="standard", 
         console_logs = []
         network_logs = []
 
-        with sync_playwright() as p:
+        with _playwright()() as p:
             # Phase 2: Mobile Emulation
             is_mobile = device == "mobile"
             if is_mobile:
@@ -2658,7 +2665,7 @@ def _discovery_worker(pid, base_url, sid):
             time.sleep(0.1)
 
         log_cb("info", "Launching browser...")
-        with sync_playwright() as p:
+        with _playwright()() as p:
             browser = p.chromium.launch(headless=True)
             clean_base, creds, req_auth = _extract_auth_credentials(base_url)
             ctx_args = {"viewport": {"width": 1280, "height": 720}}

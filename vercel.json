@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "smart_tester.py": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  }
+}
