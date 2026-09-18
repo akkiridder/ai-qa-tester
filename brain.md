@@ -774,5 +774,21 @@ AI Agent QA Tester — a Flask + vanilla JS web app that lets users:
 
 ### Notes / Follow-ups
 - Vercel stores data in `/tmp/ai-qa-data` (ephemeral, read-only FS otherwise) driven by `VERCEL` env — **projects are NOT persisted** across cold starts. Local `data/database.json` stays authoritative. Optional future work: seed `/tmp` from committed DB on boot, or move to a persistent store.
-- Local & GitHub `main` are in sync at `12af46a`.
+- Local & GitHub `main` are in sync at `f39af40`.
+
+### 6. Always-On Basic Auth (Password Lock — commit `f39af40`)
+- **Goal**: Keep the live site private with zero Vercel dashboard setup.
+- `AUTH_USER` / `AUTH_PASS` now have **built-in fallbacks in code** (env / `.env` still override):
+  - Fallback: `AUTH_USER=aiqa`, `AUTH_PASS=Q7#vM2!kN9@xW4`
+  - Local `.env` credentials (`Akki` / `Akki@123`) keep working locally.
+- Because auth vars are now never empty, `check_api_key` always locks the **entire site** (UI + all `/api/*`) with the browser's native Basic Auth popup. No login → `401 Unauthorized`.
+- Verified: fallback + env-override + local `.env` paths; **45/45 pytest passing**.
+- **Live status**: ✅ working on `https://ai-qa-tester-kappa.vercel.app` (verified by user after redeploy).
+
+### 7. HTTP Security Headers Hardening (commit `49e51e0`)
+- Added `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Resource-Policy: same-origin`.
+- CSP now includes `upgrade-insecure-requests`.
+- All `/api/*` responses now get `Cache-Control: no-store, no-cache, must-revalidate, max-age=0` + `Pragma: no-cache` — **CDN never caches project/API data** (this also stopped the earlier cached-index.html served on `/api/health`).
+- Pre-existing headers kept: CSP, HSTS (Vercel edge), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`.
+- Full header set verified present on live responses before/after these changes.
 
