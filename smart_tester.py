@@ -1891,6 +1891,9 @@ def api_delete_project(pid):
         projects_table.remove(record_id_cond(pid))
         test_cases_table.remove(Query().projectId==pid)
         results_table.remove(Query().projectId==pid)
+    # Direct table.remove above bypasses safe_* helpers, so the in-memory
+    # _table_cache would serve stale rows (deleted project still visible in UI).
+    _invalidate_table_cache()
     return ok({"status":"deleted"})
 
 @app.route("/api/projects/<pid>/dashboard")
