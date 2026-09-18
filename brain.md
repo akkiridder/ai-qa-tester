@@ -792,3 +792,10 @@ AI Agent QA Tester — a Flask + vanilla JS web app that lets users:
 - Pre-existing headers kept: CSP, HSTS (Vercel edge), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`.
 - Full header set verified present on live responses before/after these changes.
 
+### 8. Project Delete Fix — Stale Cache (commit `fc52648`)
+- **Symptom**: Deleting a project showed `DELETE /api/projects/<pid>` → `200 OK`, but the project **stayed visible** in the UI.
+- **Root cause**: `api_delete_project` called `projects_table.remove()` directly, bypassing the `safe_*` helpers. The `safe_all()` in-memory `_table_cache` was **never invalidated**, so subsequent `GET /api/projects` kept returning rows with the deleted project (ghost rows). The record *was* removed from `database.json` on disk — only the cache was stale.
+- **Fix**: Added `_invalidate_table_cache()` after the removes in `api_delete_project`.
+- **Verified**: Flask test-client reproduction (create → warm cache → delete → gone) passed; server restart cleared the ghost projects; **45/45 pytest passing**.
+- **Note**: Running servers must be restarted to pick up the fix (in-memory cache from old code persists until then).
+
