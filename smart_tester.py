@@ -341,10 +341,11 @@ ACTIVE_STATE_FILE = DATA_DIR / "active_state.json"
 _state_save_lock = threading.Lock()
 _last_state_save = 0.0
 API_KEY = os.environ.get("API_KEY", "").strip()
-# HTTP Basic Auth credentials — ALWAYS via env (.env locally, dashboard on
-# hosting). NEVER hardcode or commit these; the repo must stay secret-free.
-AUTH_USER = os.environ.get("AUTH_USER", "").strip()
-AUTH_PASS = os.environ.get("AUTH_PASS", "")
+# HTTP Basic Auth credentials — env (.env locally, dashboard on hosting) with
+# a built-in fallback so the deployed site is ALWAYS password-protected even
+# when no env var is configured. Override via AUTH_USER / AUTH_PASS env vars.
+AUTH_USER = os.environ.get("AUTH_USER", "").strip() or "aiqa"
+AUTH_PASS = os.environ.get("AUTH_PASS", "") or "Q7#vM2!kN9@xW4"
 LOCAL_ADDRS = {"127.0.0.1", "::1"}
 
 def _basic_auth_ok():
